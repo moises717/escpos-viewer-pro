@@ -108,6 +108,20 @@ pub fn parse_escpos(data: &[u8], codepage: CodePage) -> Vec<ParsedCommand> {
                 if i + 1 < data.len() {
                     let next_byte = data[i + 1];
                     match next_byte {
+                        // Configuración común de barcode/HRI: consumir el parámetro para que no se filtre como texto.
+                        // GS H n (HRI position), GS h n (height), GS w n (width), GS f n (HRI font)
+                        0x48 | 0x68 | 0x77 | 0x66 => {
+                            commands.push((
+                                state.clone(),
+                                CommandType::Control(Control::GsUnknown(next_byte)),
+                            ));
+                            // Consumir también el byte parámetro (n) si existe.
+                            if i + 2 < data.len() {
+                                i += 3;
+                            } else {
+                                i += 2;
+                            }
+                        }
                         0x76 => {
                             // GS v 0 m xL xH yL yH d...
                             if i + 7 < data.len() && data[i + 2] == 0x30 {
@@ -265,8 +279,9 @@ pub fn parse_escpos(data: &[u8], codepage: CodePage) -> Vec<ParsedCommand> {
                             // GS ! n
                             if i + 2 < data.len() {
                                 let n = data[i + 2];
-                                let height = n & 0x0F;
-                                let width = (n >> 4) & 0x0F;
+                                // ESC/POS: low nibble = width, high nibble = height.
+                                let width = n & 0x0F;
+                                let height = (n >> 4) & 0x0F;
                                 state.char_width_mul = width.saturating_add(1);
                                 state.char_height_mul = height.saturating_add(1);
                                 state.font_scale = state.char_height_mul as f32;
@@ -460,5 +475,31 @@ mod tests {
             CommandType::Control(Control::Qr { data, .. }) => data == b"HI",
             _ => false,
         }));
+    }
+
+    #[test]
+    fn gs_bang_size_0x10_is_double_height_not_double_width() {
+        // GS ! 0x10 => height x2, width x1.
+        let data = [0x1D, 0x21, 0x10, b'A'];
+        let parsed = parse_escpos(&data, CodePage::Utf8Lossy);
+
+        let a_state = parsed
+            .iter()
+            .find(|(_, c)| matches!(c, CommandType::Text(t) if t.contains('A')))
+            .map(|(s, _)| s)
+            .unwrap();
+
+        assert_eq!(a_state.char_width_mul, 1);
+        assert_eq!(a_state.char_height_mul, 2);
+    }
+
+    #[test]
+    fn gs_h_parameter_is_consumed_not_emitted_as_text() {
+        // Algunos sistemas mandan GS H '2' (ASCII) y no queremos ver un "2" impreso.
+        let data = [0x1D, 0x48, b'2', b'A'];
+        let parsed = parse_escpos(&data, CodePage::Utf8Lossy);
+        let texts = collect_text(&parsed).concat();
+        assert!(!texts.contains('2'));
+        assert!(texts.contains('A'));
     }
 }
