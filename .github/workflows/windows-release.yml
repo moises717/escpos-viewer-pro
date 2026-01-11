@@ -1,0 +1,70 @@
+name: Windows Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        shell: pwsh
+        run: |
+          cargo build --release
+
+      - name: Install Inno Setup (Chocolatey)
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+
+      - name: Compute version from tag
+        id: vars
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}"
+          if ($v.StartsWith('v')) { $v = $v.Substring(1) }
+          if ([string]::IsNullOrWhiteSpace($v)) { throw "Version empty" }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Build installer (setup.iss)
+        shell: pwsh
+        run: |
+          $iscc = "C:\\Program Files (x86)\\Inno Setup 6\\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            throw "ISCC not found at $iscc"
+          }
+          & $iscc "setup.iss" "/DMyAppVersion=${{ steps.vars.outputs.version }}"
+
+      - name: Verify outputs
+        shell: pwsh
+        run: |
+          $portable = "target\\release\\escpos_viewer.exe"
+          $installer = "installer\\InstaladorVisorESCPOS.exe"
+          if (-not (Test-Path $portable)) { throw "Missing: $portable" }
+          if (-not (Test-Path $installer)) { throw "Missing: $installer" }
+          Get-Item $portable, $installer | Format-List FullName, Length, LastWriteTime
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "${{ github.ref_name }}"
+          generate_release_notes: true
+          files: |
+            target/release/escpos_viewer.exe
+            installer/InstaladorVisorESCPOS.exe

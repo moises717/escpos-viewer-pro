@@ -1,0 +1,19 @@
+[package]
+name = "escpos_viewer"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+eframe = "0.29" # Framework GUI
+rfd = "0.15"    # Diálogos de archivo nativos
+oem_cp = "2.1.2"
+encoding_rs = "0.8"
+qrcode = "0.14"
+tray-icon = "0.19"
+raw-window-handle = "0.6"
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"] }
+ico = "0.3"
+
+[build-dependencies]
+winres = "0.1"
