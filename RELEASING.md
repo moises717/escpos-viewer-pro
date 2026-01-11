@@ -16,6 +16,12 @@ Flujo:
 - En el repo: Settings → Actions → General → **Workflow permissions** → habilitar
 	“Read and write permissions” y permitir crear PRs.
 
+- Recomendado: crear un secret `RELEASE_PLZ_TOKEN` (Fine-grained PAT) con permisos:
+	- Contents: Read and write
+	- Pull requests: Read and write
+	Esto es necesario porque los tags pusheados con `GITHUB_TOKEN` normalmente no disparan otros workflows,
+	y necesitamos que el tag `v*` dispare [​.github/workflows/windows-release.yml](.github/workflows/windows-release.yml).
+
 ## Auto-merge (opcional)
 
 Este repo incluye el workflow [​.github/workflows/auto-merge-release-plz.yml](.github/workflows/auto-merge-release-plz.yml) que habilita
