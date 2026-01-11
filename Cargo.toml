@@ -15,6 +15,7 @@ tray-icon = "0.19"
 raw-window-handle = "0.6"
 windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"] }
 ico = "0.3"
+single-instance = "0.3"
 
 [build-dependencies]
 winres = "0.1"

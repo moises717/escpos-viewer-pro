@@ -8,6 +8,42 @@ mod tcp_capture;
 mod tray;
 mod window_control;
 
+#[cfg(target_os = "windows")]
+fn try_focus_existing_instance_window() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, FindWindowW, SetForegroundWindow, SetWindowPos, ShowWindow,
+        HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE, SW_SHOW,
+    };
+
+    fn wide_null_terminated(s: &str) -> Vec<u16> {
+        let mut v: Vec<u16> = s.encode_utf16().collect();
+        v.push(0);
+        v
+    }
+
+    // Intentar por títulos conocidos.
+    for title in ["Visor ESC-POS", "Visor ESC/POS"] {
+        let title_w = wide_null_terminated(title);
+        let hwnd = unsafe { FindWindowW(core::ptr::null(), title_w.as_ptr()) };
+        if hwnd.is_null() {
+            continue;
+        }
+
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+
+            // TOPMOST -> NOTOPMOST para forzar foco.
+            let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+            let _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+
+            let _ = BringWindowToTop(hwnd);
+            let _ = SetForegroundWindow(hwnd);
+        }
+        break;
+    }
+}
+
 fn main() -> eframe::Result<()> {
     // Modo instalador/CLI (Windows): permite que un instalador cree la impresora virtual.
     // Requiere ejecutar como Administrador.
@@ -35,6 +71,17 @@ fn main() -> eframe::Result<()> {
                 std::process::exit(1);
             }
         }
+    }
+
+    // Single instance: evita que una segunda instancia intente abrir el puerto 9100.
+    let instance = single_instance::SingleInstance::new("visor-escpos-viewer")
+        .expect("single-instance init failed");
+    if !instance.is_single() {
+        #[cfg(target_os = "windows")]
+        {
+            try_focus_existing_instance_window();
+        }
+        return Ok(());
     }
 
     let options = eframe::NativeOptions {
