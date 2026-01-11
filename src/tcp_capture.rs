@@ -98,7 +98,8 @@ fn read_one_job(
 ) -> std::io::Result<()> {
     // Normalmente Windows abre conexin, manda bytes y cierra (EOF) por job.
     // Pongo timeout por si el peer se queda abierto.
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    // Un timeout muy corto puede partir un ticket en 2 jobs si el POS manda en ráfagas.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
 
     let mut buf = Vec::new();
     let mut tmp = [0u8; 8192];

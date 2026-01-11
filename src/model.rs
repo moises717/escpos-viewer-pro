@@ -38,8 +38,22 @@ pub enum Control {
         data: Vec<u8>,
     },
 
+    /// Configuración de barcode (HRI/alto/ancho/fuente).
+    BarcodeHriPosition(BarcodeHriPosition),
+    BarcodeHeight(u8),
+    BarcodeModuleWidth(u8),
+    BarcodeHriFont(u8),
+
     EscUnknown(u8),
     GsUnknown(u8),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BarcodeHriPosition {
+    None,
+    Above,
+    Below,
+    Both,
 }
 
 #[derive(Clone, Debug)]
@@ -49,6 +63,11 @@ pub struct PrinterState {
     pub font_scale: f32,
     pub char_width_mul: u8,
     pub char_height_mul: u8,
+
+    pub barcode_hri: BarcodeHriPosition,
+    pub barcode_height: u8,
+    pub barcode_module_width: u8,
+    pub barcode_hri_font: u8,
 }
 
 impl Default for PrinterState {
@@ -59,6 +78,12 @@ impl Default for PrinterState {
             font_scale: 1.0,
             char_width_mul: 1,
             char_height_mul: 1,
+
+            barcode_hri: BarcodeHriPosition::None,
+            // Valores típicos (pueden variar por impresora, pero sirven para preview).
+            barcode_height: 80,
+            barcode_module_width: 3,
+            barcode_hri_font: 0,
         }
     }
 }

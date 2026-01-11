@@ -1,6 +1,6 @@
 use crate::escpos::parse_escpos;
 use crate::hex_dump::pretty_hex;
-use crate::model::{Align, CodePage, CommandType, Control, PaperWidth, PrinterState};
+use crate::model::{Align, BarcodeHriPosition, CodePage, CommandType, Control, PaperWidth, PrinterState};
 use crate::tcp_capture::TcpCapture;
 use crate::tray::SystemTray;
 use crate::window_control::WindowControl;
@@ -51,6 +51,7 @@ pub struct EscPosViewer {
     did_apply_initial_window_position: bool,
     show_debug_controls: bool,
     show_debug_panels: bool,
+    show_settings: bool,
     ui_mode: UiMode,
     last_ui_mode: UiMode,
     codepage: CodePage,
@@ -59,6 +60,8 @@ pub struct EscPosViewer {
     tcp_capture: Option<TcpCapture>,
     tcp_last_error: Option<String>,
     tcp_enabled: bool,
+    ignore_noise_jobs: bool,
+    ignore_noise_jobs_max_bytes: usize,
 
     tray: Option<SystemTray>,
     tray_error: Option<String>,
@@ -88,6 +91,7 @@ impl Default for EscPosViewer {
             did_apply_initial_window_position: false,
             show_debug_controls: false,
             show_debug_panels: false,
+            show_settings: false,
             ui_mode: UiMode::Preview,
             last_ui_mode: UiMode::Preview,
             codepage: CodePage::Utf8Lossy,
@@ -95,6 +99,8 @@ impl Default for EscPosViewer {
             tcp_capture: None,
             tcp_last_error: None,
             tcp_enabled: true,
+            ignore_noise_jobs: true,
+            ignore_noise_jobs_max_bytes: 32,
 
             tray: None,
             tray_error: None,
@@ -110,6 +116,44 @@ impl Default for EscPosViewer {
 }
 
 impl EscPosViewer {
+    fn should_ignore_tcp_job(&self, bytes: &[u8]) -> bool {
+        if !self.ignore_noise_jobs {
+            return false;
+        }
+
+        if bytes.is_empty() {
+            return true;
+        }
+
+        if bytes.len() > self.ignore_noise_jobs_max_bytes {
+            return false;
+        }
+
+        // Heurística: si el job no produce salida visible (texto/imagen/qr/barcode/corte), lo ignoramos.
+        // Esto evita tabs "fantasma" de 10-20 bytes que algunos POS envían como consulta de estado.
+        let parsed = parse_escpos(bytes, self.codepage);
+        for (_state, cmd) in parsed {
+            match cmd {
+                CommandType::Text(t) => {
+                    if t.chars().any(|c| !c.is_whitespace()) {
+                        return false;
+                    }
+                }
+                CommandType::Control(control) => match control {
+                    Control::RasterImage { .. }
+                    | Control::Qr { .. }
+                    | Control::Barcode { .. }
+                    | Control::Cut => {
+                        return false;
+                    }
+                    _ => {}
+                },
+                CommandType::Unknown(_) => {}
+            }
+        }
+
+        true
+    }
     fn format_age_short(d: Duration) -> String {
         let secs = d.as_secs();
         if secs < 60 {
@@ -124,37 +168,20 @@ impl EscPosViewer {
     }
 
     fn ui_job_tabs(&mut self, ui: &mut egui::Ui) {
-        ui.separator();
-
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("🧹 Limpiar historial").clicked() {
-                self.jobs.clear();
-                self.active_job_idx = None;
-            }
-
-            ui.checkbox(&mut self.auto_scroll_on_print, "Auto-scroll al imprimir");
-
-            ui.add(egui::Slider::new(&mut self.max_jobs, 1..=100).text("Máx jobs"));
-
-            ui.checkbox(&mut self.auto_prune_by_age, "Autolimpieza por edad");
-            if self.auto_prune_by_age {
-                let mut mins = (self.prune_after.as_secs() / 60).max(1);
-                ui.add(egui::Slider::new(&mut mins, 1..=24 * 60).text("min"));
-                self.prune_after = Duration::from_secs(mins * 60);
-            }
-        });
-
         if self.jobs.is_empty() {
-            ui.label(egui::RichText::new("(sin trabajos aún)").weak());
             return;
         }
 
         let mut to_close: Option<usize> = None;
+        ui.separator();
         egui::ScrollArea::horizontal()
             .id_salt("job_tabs_scroll")
             .max_height(34.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    // Más espacio entre pestañas (antes quedaban muy pegadas).
+                    ui.spacing_mut().item_spacing.x = 10.0;
+
                     let now = Instant::now();
                     for (idx, job) in self.jobs.iter().enumerate() {
                         let selected = self.active_job_idx == Some(idx);
@@ -174,11 +201,23 @@ impl EscPosViewer {
                             job.full_bytes.len()
                         );
 
-                        if ui.selectable_label(selected, tab_text).clicked() {
+                        let tab_btn = egui::Button::new(tab_text)
+                            .selected(selected)
+                            .min_size(egui::vec2(0.0, 24.0));
+                        if ui.add(tab_btn).clicked() {
                             self.active_job_idx = Some(idx);
                         }
 
-                        if ui.small_button("✕").on_hover_text("Cerrar").clicked() {
+                        // Usar 'X' ASCII (evita el cuadrito por falta de glyph).
+                        let close_btn = egui::Button::new(
+                            egui::RichText::new("X")
+                                .strong()
+                                .color(egui::Color32::from_gray(220)),
+                        )
+                        .fill(egui::Color32::from_gray(70))
+                        .min_size(egui::vec2(24.0, 24.0));
+
+                        if ui.add(close_btn).on_hover_text("Cerrar").clicked() {
                             to_close = Some(idx);
                         }
                     }
@@ -197,6 +236,155 @@ impl EscPosViewer {
                 }
             }
         }
+    }
+
+    fn ui_settings_modal(&mut self, ctx: &egui::Context) {
+        if !self.show_settings {
+            return;
+        }
+
+        let mut open = self.show_settings;
+        egui::Window::new("Configuración")
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .collapsible(false)
+            .resizable(false)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(10.0, 8.0);
+
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Ajustes del visor").strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Cerrar").clicked() {
+                            self.show_settings = false;
+                        }
+                    });
+                });
+                ui.separator();
+
+                egui::Grid::new("settings_grid")
+                    .num_columns(2)
+                    .spacing([16.0, 10.0])
+                    .show(ui, |ui| {
+                        // Captura TCP
+                        ui.label(egui::RichText::new("Captura").strong());
+                        ui.vertical(|ui| {
+                            let enabled_before = self.tcp_enabled;
+                            ui.checkbox(&mut self.tcp_enabled, "Escuchar impresora (TCP 9100)");
+                            if self.tcp_enabled != enabled_before {
+                                if self.tcp_enabled {
+                                    self.set_tcp_capture(true, Some(ctx.clone()));
+                                } else {
+                                    self.set_tcp_capture(false, None);
+                                }
+                            }
+                            if let Some(err) = &self.tcp_last_error {
+                                ui.label(egui::RichText::new(err).color(egui::Color32::RED).small());
+                            } else {
+                                ui.label(egui::RichText::new("127.0.0.1:9100").weak().small());
+                            }
+
+                            ui.add_space(4.0);
+                            ui.checkbox(&mut self.ignore_noise_jobs, "Ignorar jobs pequeños (ruido)");
+                            if self.ignore_noise_jobs {
+                                ui.add(
+                                    egui::Slider::new(&mut self.ignore_noise_jobs_max_bytes, 8..=128)
+                                        .text("bytes"),
+                                );
+                            }
+                        });
+                        ui.end_row();
+
+                        // Simulación
+                        ui.label(egui::RichText::new("Impresión").strong());
+                        ui.vertical(|ui| {
+                            let before_sim = self.simulate_printing;
+                            ui.checkbox(&mut self.simulate_printing, "Simular impresión");
+                            ui.add(
+                                egui::Slider::new(&mut self.sim_bytes_per_sec, 1_000..=200_000)
+                                    .text("bytes/s"),
+                            );
+                            if before_sim && !self.simulate_printing {
+                                self.stop_active_simulation_show_full();
+                            }
+                            if let Some(job) = self.active_job() {
+                                if job.sim_active {
+                                    let total = job.full_bytes.len().max(1);
+                                    let pct = (job.sim_sent as f32 / total as f32) * 100.0;
+                                    ui.label(
+                                        egui::RichText::new(format!("Progreso: {pct:.0}%"))
+                                            .color(egui::Color32::DARK_GRAY)
+                                            .small(),
+                                    );
+                                }
+                            }
+                        });
+                        ui.end_row();
+
+                        // Papel
+                        ui.label(egui::RichText::new("Papel").strong());
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut self.paper_width, PaperWidth::W58mm, "58mm");
+                            ui.selectable_value(&mut self.paper_width, PaperWidth::W80mm, "80mm");
+                        });
+                        ui.end_row();
+
+                        // Codepage
+                        ui.label(egui::RichText::new("Codificación").strong());
+                        ui.vertical(|ui| {
+                            let before = self.codepage;
+                            egui::ComboBox::from_label("Codepage")
+                                .selected_text(match self.codepage {
+                                    CodePage::Utf8Lossy => "UTF-8 (auto: fallback Win-1252)",
+                                    CodePage::Cp437 => "CP437",
+                                    CodePage::Cp850 => "CP850",
+                                    CodePage::Windows1252 => "Windows-1252",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut self.codepage, CodePage::Utf8Lossy, "UTF-8 (auto: fallback Win-1252)");
+                                    ui.selectable_value(&mut self.codepage, CodePage::Cp437, "CP437");
+                                    ui.selectable_value(&mut self.codepage, CodePage::Cp850, "CP850");
+                                    ui.selectable_value(&mut self.codepage, CodePage::Windows1252, "Windows-1252");
+                                });
+                            if self.codepage != before {
+                                self.reparse_all_jobs();
+                            }
+                        });
+                        ui.end_row();
+
+                        // Historial
+                        ui.label(egui::RichText::new("Historial").strong());
+                        ui.vertical(|ui| {
+                            ui.checkbox(&mut self.auto_scroll_on_print, "Auto-scroll al imprimir");
+                            ui.add(egui::Slider::new(&mut self.max_jobs, 1..=100).text("Máx jobs"));
+                            ui.checkbox(&mut self.auto_prune_by_age, "Autolimpieza por edad");
+                            if self.auto_prune_by_age {
+                                let mut mins = (self.prune_after.as_secs() / 60).max(1);
+                                ui.add(egui::Slider::new(&mut mins, 1..=24 * 60).text("min"));
+                                self.prune_after = Duration::from_secs(mins * 60);
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.button("🧹 Limpiar historial").clicked() {
+                                    self.jobs.clear();
+                                    self.active_job_idx = None;
+                                }
+                                ui.label(egui::RichText::new(format!("Jobs: {}", self.jobs.len())).weak());
+                            });
+                        });
+                        ui.end_row();
+
+                        // Debug
+                        ui.label(egui::RichText::new("Debug").strong());
+                        ui.vertical(|ui| {
+                            ui.checkbox(&mut self.show_debug_panels, "Mostrar Hex/Log");
+                            ui.checkbox(&mut self.show_debug_controls, "Debug comandos");
+                        });
+                        ui.end_row();
+                    });
+            });
+
+        self.show_settings = open;
     }
     fn active_job(&self) -> Option<&JobEntry> {
         self.active_job_idx
@@ -481,6 +669,10 @@ impl EscPosViewer {
             Control::Barcode { m, data } => {
                 format!("GS k (BARCODE m={:02X} bytes={})", m, data.len())
             }
+            Control::BarcodeHriPosition(pos) => format!("GS H (HRI={:?})", pos),
+            Control::BarcodeHeight(n) => format!("GS h (BARCODE HEIGHT={})", n),
+            Control::BarcodeModuleWidth(n) => format!("GS w (BARCODE WIDTH={})", n),
+            Control::BarcodeHriFont(n) => format!("GS f (HRI FONT={})", n),
             Control::EscUnknown(b) => format!("ESC {:02X} (?)", b),
             Control::GsUnknown(b) => format!("GS {:02X} (?)", b),
         }
@@ -698,6 +890,507 @@ impl EscPosViewer {
         let display = egui::vec2(target_width, h * scale);
         ui.image((tex.id(), display));
     }
+
+    fn runs_to_image(
+        runs: &[u8],
+        start_with_black: bool,
+        module_px: usize,
+        height_px: usize,
+        quiet_zone_modules: usize,
+    ) -> Option<egui::ColorImage> {
+        if runs.is_empty() || module_px == 0 || height_px == 0 {
+            return None;
+        }
+
+        let total_modules: usize = runs.iter().map(|&r| r as usize).sum::<usize>()
+            + quiet_zone_modules.saturating_mul(2);
+        if total_modules == 0 {
+            return None;
+        }
+
+        let width_px = total_modules.saturating_mul(module_px).max(1);
+        let height_px = height_px.max(1);
+
+        let mut pixels = vec![egui::Color32::WHITE; width_px * height_px];
+
+        // Quiet zone a la izquierda.
+        let mut x_px = quiet_zone_modules.saturating_mul(module_px);
+        let mut black = start_with_black;
+
+        for &run in runs {
+            let run_px = (run as usize).saturating_mul(module_px);
+            if black && run_px > 0 {
+                let x0 = x_px.min(width_px);
+                let x1 = (x_px + run_px).min(width_px);
+                for y in 0..height_px {
+                    let row = y * width_px;
+                    for x in x0..x1 {
+                        pixels[row + x] = egui::Color32::BLACK;
+                    }
+                }
+            }
+
+            x_px = x_px.saturating_add(run_px);
+            black = !black;
+            if x_px >= width_px {
+                break;
+            }
+        }
+
+        Some(egui::ColorImage {
+            size: [width_px, height_px],
+            pixels,
+        })
+    }
+
+    fn bits01_to_runs(bits: &[u8]) -> Option<(Vec<u8>, bool)> {
+        if bits.is_empty() {
+            return None;
+        }
+        let mut runs: Vec<u8> = Vec::new();
+        let mut current = bits[0];
+        let mut len: usize = 0;
+        for &b in bits {
+            if b == current {
+                len += 1;
+            } else {
+                runs.push(len.min(255) as u8);
+                current = b;
+                len = 1;
+            }
+        }
+        runs.push(len.min(255) as u8);
+        let start_with_black = bits[0] == 1;
+        Some((runs, start_with_black))
+    }
+
+    fn clean_code128_hri(data: &[u8]) -> String {
+        // ESC/POS suele enviar prefijos como "{B" y escapes "{{".
+        let s = String::from_utf8_lossy(data);
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+
+        // Consumir prefijo inicial {A/{B/{C}
+        if let Some('{') = chars.peek().copied() {
+            let mut clone = chars.clone();
+            let _ = clone.next();
+            if let Some(next) = clone.next() {
+                if matches!(next, 'A' | 'B' | 'C') {
+                    let _ = chars.next();
+                    let _ = chars.next();
+                }
+            }
+        }
+
+        while let Some(ch) = chars.next() {
+            if ch == '{' {
+                match chars.peek().copied() {
+                    Some('{') => {
+                        let _ = chars.next();
+                        out.push('{');
+                    }
+                    Some('A' | 'B' | 'C') => {
+                        let _ = chars.next();
+                        // cambio de code set: no se imprime
+                    }
+                    Some('1' | '2' | '3' | '4') => {
+                        let _ = chars.next();
+                        // FNC*: omitimos en HRI
+                    }
+                    _ => {
+                        // Si no reconocemos, imprimimos el '{'
+                        out.push('{');
+                    }
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    fn encode_code128_runs(data: &[u8]) -> Option<(Vec<u8>, String)> {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum CodeSet {
+            A,
+            B,
+            C,
+        }
+
+        // Tabla Code128 (widths alternando bar/space). Stop (106) tiene 7 dígitos.
+        const PATTERNS: [&str; 107] = [
+            "212222", "222122", "222221", "121223", "121322", "131222", "122213",
+            "122312", "132212", "221213", "221312", "231212", "112232", "122132",
+            "122231", "113222", "123122", "123221", "223211", "221132", "221231",
+            "213212", "223112", "312131", "311222", "321122", "321221", "312212",
+            "322112", "322211", "212123", "212321", "232121", "111323", "131123",
+            "131321", "112313", "132113", "132311", "211313", "231113", "231311",
+            "112133", "112331", "132131", "113123", "113321", "133121", "313121",
+            "211331", "231131", "213113", "213311", "213131", "311123", "311321",
+            "331121", "312113", "312311", "332111", "314111", "221411", "431111",
+            "111224", "111422", "121124", "121421", "141122", "141221", "112214",
+            "112412", "122114", "122411", "142112", "142211", "241211", "221114",
+            "413111", "241112", "134111", "111242", "121142", "121241", "114212",
+            "124112", "124211", "411212", "421112", "421211", "212141", "214121",
+            "412121", "111143", "111341", "131141", "114113", "114311", "411113",
+            "411311", "113141", "114131", "311141", "411131", "211412", "211214",
+            "211232", "2331112",
+        ];
+
+        let s = String::from_utf8_lossy(data);
+        let mut bytes = s.as_bytes();
+
+        let mut set = CodeSet::B;
+        if bytes.len() >= 2 && bytes[0] == b'{' {
+            match bytes[1] {
+                b'A' => {
+                    set = CodeSet::A;
+                    bytes = &bytes[2..];
+                }
+                b'B' => {
+                    set = CodeSet::B;
+                    bytes = &bytes[2..];
+                }
+                b'C' => {
+                    set = CodeSet::C;
+                    bytes = &bytes[2..];
+                }
+                _ => {}
+            }
+        }
+
+        let start_code: u8 = match set {
+            CodeSet::A => 103,
+            CodeSet::B => 104,
+            CodeSet::C => 105,
+        };
+
+        let hri = Self::clean_code128_hri(bytes);
+
+        let mut codes: Vec<u8> = Vec::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == b'{' && i + 1 < bytes.len() {
+                let n = bytes[i + 1];
+                match n {
+                    b'{' => {
+                        // literal '{'
+                        match set {
+                            CodeSet::B => {
+                                codes.push((b'{' - 32) as u8);
+                            }
+                            CodeSet::A => {
+                                codes.push((b'{' - 32) as u8);
+                            }
+                            CodeSet::C => {
+                                // en C no cabe, cambiamos a B
+                                codes.push(100);
+                                set = CodeSet::B;
+                                codes.push((b'{' - 32) as u8);
+                            }
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    b'A' => {
+                        codes.push(101);
+                        set = CodeSet::A;
+                        i += 2;
+                        continue;
+                    }
+                    b'B' => {
+                        codes.push(100);
+                        set = CodeSet::B;
+                        i += 2;
+                        continue;
+                    }
+                    b'C' => {
+                        codes.push(99);
+                        set = CodeSet::C;
+                        i += 2;
+                        continue;
+                    }
+                    b'1' => {
+                        // FNC1
+                        codes.push(102);
+                        i += 2;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+
+            match set {
+                CodeSet::C => {
+                    if i + 1 < bytes.len()
+                        && bytes[i].is_ascii_digit()
+                        && bytes[i + 1].is_ascii_digit()
+                    {
+                        let v = (bytes[i] - b'0') * 10 + (bytes[i + 1] - b'0');
+                        codes.push(v);
+                        i += 2;
+                    } else {
+                        // Cambiar a B para seguir.
+                        codes.push(100);
+                        set = CodeSet::B;
+                    }
+                }
+                CodeSet::B => {
+                    // Code B: ASCII 32..127
+                    if b >= 32 && b <= 127 {
+                        codes.push((b - 32) as u8);
+                    } else {
+                        codes.push((b'?' - 32) as u8);
+                    }
+                    i += 1;
+                }
+                CodeSet::A => {
+                    // Code A: 0..95
+                    let v: u8 = if b < 32 {
+                        b + 64
+                    } else if b <= 95 {
+                        b - 32
+                    } else {
+                        (b'?' - 32) as u8
+                    };
+                    codes.push(v);
+                    i += 1;
+                }
+            }
+        }
+
+        // Checksum
+        let mut sum: u32 = start_code as u32;
+        for (pos, &c) in codes.iter().enumerate() {
+            sum = sum.wrapping_add((c as u32) * ((pos + 1) as u32));
+        }
+        let checksum: u8 = (sum % 103) as u8;
+
+        let mut all_codes: Vec<u8> = Vec::with_capacity(2 + codes.len());
+        all_codes.push(start_code);
+        all_codes.extend_from_slice(&codes);
+        all_codes.push(checksum);
+        all_codes.push(106);
+
+        let mut runs: Vec<u8> = Vec::new();
+        for &code in &all_codes {
+            let pat = PATTERNS.get(code as usize)?;
+            for ch in pat.chars() {
+                let d = ch.to_digit(10)? as u8;
+                runs.push(d);
+            }
+        }
+
+        Some((runs, hri))
+    }
+
+    fn encode_ean_runs(digits: &str) -> Option<(Vec<u8>, String)> {
+        // Devuelve runs (módulos) para EAN-13 o EAN-8, según longitud.
+        let mut s: String = digits.chars().filter(|c| c.is_ascii_digit()).collect();
+        if s.len() == 7 || s.len() == 12 {
+            // calcular checksum y anexar
+            let sum: u32 = s
+                .chars()
+                .rev()
+                .enumerate()
+                .map(|(i, c)| {
+                    let d = c.to_digit(10).unwrap_or(0);
+                    let w = if i % 2 == 0 { 3 } else { 1 };
+                    d * w
+                })
+                .sum();
+            let chk = (10 - (sum % 10)) % 10;
+            s.push(char::from(b'0' + (chk as u8)));
+        }
+
+        if s.len() == 13 {
+            const L: [&str; 10] = [
+                "0001101", "0011001", "0010011", "0111101", "0100011",
+                "0110001", "0101111", "0111011", "0110111", "0001011",
+            ];
+            const G: [&str; 10] = [
+                "0100111", "0110011", "0011011", "0100001", "0011101",
+                "0111001", "0000101", "0010001", "0001001", "0010111",
+            ];
+            const R: [&str; 10] = [
+                "1110010", "1100110", "1101100", "1000010", "1011100",
+                "1001110", "1010000", "1000100", "1001000", "1110100",
+            ];
+            const PAR: [&str; 10] = [
+                "LLLLLL", "LLGLGG", "LLGGLG", "LLGGGL", "LGLLGG",
+                "LGGLLG", "LGGGLL", "LGLGLG", "LGLGGL", "LGGLGL",
+            ];
+
+            let first = s.chars().next()?.to_digit(10)? as usize;
+            let parity = PAR[first];
+            let left = &s[1..7];
+            let right = &s[7..13];
+
+            let mut bits: Vec<u8> = Vec::with_capacity(95);
+            // start guard
+            bits.extend_from_slice(&[1, 0, 1]);
+            // left
+            for (i, ch) in left.chars().enumerate() {
+                let d = ch.to_digit(10)? as usize;
+                let pat = match parity.chars().nth(i)? {
+                    'L' => L[d],
+                    'G' => G[d],
+                    _ => L[d],
+                };
+                for b in pat.bytes() {
+                    bits.push((b == b'1') as u8);
+                }
+            }
+            // middle guard
+            bits.extend_from_slice(&[0, 1, 0, 1, 0]);
+            // right
+            for ch in right.chars() {
+                let d = ch.to_digit(10)? as usize;
+                let pat = R[d];
+                for b in pat.bytes() {
+                    bits.push((b == b'1') as u8);
+                }
+            }
+            // end guard
+            bits.extend_from_slice(&[1, 0, 1]);
+
+            let (runs, start_black) = Self::bits01_to_runs(&bits)?;
+            if !start_black {
+                return None;
+            }
+            return Some((runs, s));
+        }
+
+        if s.len() == 8 {
+            const L: [&str; 10] = [
+                "0001101", "0011001", "0010011", "0111101", "0100011",
+                "0110001", "0101111", "0111011", "0110111", "0001011",
+            ];
+            const R: [&str; 10] = [
+                "1110010", "1100110", "1101100", "1000010", "1011100",
+                "1001110", "1010000", "1000100", "1001000", "1110100",
+            ];
+
+            let left = &s[0..4];
+            let right = &s[4..8];
+
+            let mut bits: Vec<u8> = Vec::with_capacity(67);
+            bits.extend_from_slice(&[1, 0, 1]);
+            for ch in left.chars() {
+                let d = ch.to_digit(10)? as usize;
+                for b in L[d].bytes() {
+                    bits.push((b == b'1') as u8);
+                }
+            }
+            bits.extend_from_slice(&[0, 1, 0, 1, 0]);
+            for ch in right.chars() {
+                let d = ch.to_digit(10)? as usize;
+                for b in R[d].bytes() {
+                    bits.push((b == b'1') as u8);
+                }
+            }
+            bits.extend_from_slice(&[1, 0, 1]);
+
+            let (runs, start_black) = Self::bits01_to_runs(&bits)?;
+            if !start_black {
+                return None;
+            }
+            return Some((runs, s));
+        }
+
+        None
+    }
+
+    fn encode_itf_runs(digits: &str) -> Option<(Vec<u8>, String)> {
+        let mut s: String = digits.chars().filter(|c| c.is_ascii_digit()).collect();
+        if s.is_empty() {
+            return None;
+        }
+        if s.len() % 2 == 1 {
+            s.insert(0, '0');
+        }
+
+        fn pat(d: u8) -> [u8; 5] {
+            match d {
+                0 => [1, 1, 3, 3, 1],
+                1 => [3, 1, 1, 1, 3],
+                2 => [1, 3, 1, 1, 3],
+                3 => [3, 3, 1, 1, 1],
+                4 => [1, 1, 3, 1, 3],
+                5 => [3, 1, 3, 1, 1],
+                6 => [1, 3, 3, 1, 1],
+                7 => [1, 1, 1, 3, 3],
+                8 => [3, 1, 1, 3, 1],
+                _ => [1, 3, 1, 3, 1],
+            }
+        }
+
+        let bytes = s.as_bytes();
+        let mut runs: Vec<u8> = Vec::new();
+        // Start: 1010 => [1,1,1,1]
+        runs.extend_from_slice(&[1, 1, 1, 1]);
+
+        let mut i = 0usize;
+        while i + 1 < bytes.len() {
+            let a = (bytes[i] - b'0') as u8;
+            let b = (bytes[i + 1] - b'0') as u8;
+            let pa = pat(a);
+            let pb = pat(b);
+            for k in 0..5 {
+                runs.push(pa[k]); // bar
+                runs.push(pb[k]); // space
+            }
+            i += 2;
+        }
+
+        // Stop: wide bar, narrow space, narrow bar => [3,1,1]
+        runs.extend_from_slice(&[3, 1, 1]);
+        Some((runs, s))
+    }
+
+    fn render_barcode(
+        state: &PrinterState,
+        m: u8,
+        data: &[u8],
+        target_width: f32,
+    ) -> Option<(egui::ColorImage, Option<String>)> {
+        // módulo/ancho en "módulos" (no confundir con píxeles)
+        let module_px = (state.barcode_module_width as usize).clamp(1, 6);
+        // altura: aproximamos dots a px
+        let height_px = ((state.barcode_height as f32) * 0.9).round() as usize;
+        let height_px = height_px.clamp(28, 220);
+        let quiet = 10usize;
+
+        // m según Epson ESC/POS (GS k):
+        // 67 EAN13, 68 EAN8, 70 ITF, 73 CODE128
+        let (runs, start_black, hri) = match m {
+            0x49 => {
+                let (runs, hri) = Self::encode_code128_runs(data)?;
+                (runs, true, Some(hri))
+            }
+            0x43 | 0x44 => {
+                let digits = String::from_utf8_lossy(data);
+                let (runs, hri) = Self::encode_ean_runs(&digits)?;
+                (runs, true, Some(hri))
+            }
+            0x46 => {
+                let digits = String::from_utf8_lossy(data);
+                let (runs, hri) = Self::encode_itf_runs(&digits)?;
+                (runs, true, Some(hri))
+            }
+            _ => {
+                // No soportado aún
+                return None;
+            }
+        };
+
+        let img = Self::runs_to_image(&runs, start_black, module_px, height_px, quiet)?;
+
+        // Si el barcode queda demasiado pequeño, egui lo escalará con show_image_scaled.
+        let _ = target_width;
+        Some((img, hri))
+    }
 }
 
 impl eframe::App for EscPosViewer {
@@ -794,6 +1487,9 @@ impl eframe::App for EscPosViewer {
         if let Some(cap) = &self.tcp_capture {
             let jobs = cap.try_recv_all();
             for job in jobs {
+                if self.should_ignore_tcp_job(&job.bytes) {
+                    continue;
+                }
                 let label = format!("TCP 9100 ({})", job.source);
                 self.push_new_job(label, job.bytes);
 
@@ -815,7 +1511,7 @@ impl eframe::App for EscPosViewer {
         if self.ui_mode == UiMode::Full {
             egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                if ui.button("📂 Abrir Archivo").clicked() {
+                if ui.button("📂 Abrir").clicked() {
                     if let Some(path) = FileDialog::new()
                         .add_filter("Printer Files", &["prn", "bin", "txt"])
                         .pick_file()
@@ -836,76 +1532,8 @@ impl eframe::App for EscPosViewer {
                     });
 
                 ui.separator();
-                let label = if self.show_debug_panels {
-                    "Ocultar Hex/Log"
-                } else {
-                    "Mostrar Hex/Log"
-                };
-                if ui.button(label).clicked() {
-                    self.show_debug_panels = !self.show_debug_panels;
-                }
-
-                ui.separator();
-                let enabled_before = self.tcp_enabled;
-                ui.checkbox(&mut self.tcp_enabled, "Escuchar impresora (TCP 9100)");
-                if self.tcp_enabled != enabled_before {
-                    if self.tcp_enabled {
-                        // Intentar iniciar inmediatamente al activar.
-                        self.set_tcp_capture(true, Some(ctx.clone()));
-                    } else {
-                        self.set_tcp_capture(false, None);
-                    }
-                }
-                if let Some(err) = &self.tcp_last_error {
-                    ui.label(egui::RichText::new(err).color(egui::Color32::RED).small());
-                }
-
-                ui.separator();
-                let before_sim = self.simulate_printing;
-                ui.checkbox(&mut self.simulate_printing, "Simular impresión");
-                if before_sim && !self.simulate_printing {
-                    // Si el usuario desactiva en medio de la simulación, mostramos todo.
-                    self.stop_active_simulation_show_full();
-                }
-                ui.add(
-                    egui::Slider::new(&mut self.sim_bytes_per_sec, 1_000..=200_000)
-                        .text("bytes/s"),
-                );
-                if let Some(job) = self.active_job() {
-                    if job.sim_active {
-                        let total = job.full_bytes.len().max(1);
-                        let pct = (job.sim_sent as f32 / total as f32) * 100.0;
-                    ui.label(egui::RichText::new(format!("{pct:.0}%"))
-                        .color(egui::Color32::DARK_GRAY)
-                        .small());
-                    }
-                }
-
-                ui.separator();
-                ui.label("Papel:");
-                ui.selectable_value(&mut self.paper_width, PaperWidth::W58mm, "58mm");
-                ui.selectable_value(&mut self.paper_width, PaperWidth::W80mm, "80mm");
-
-                ui.separator();
-                ui.checkbox(&mut self.show_debug_controls, "Debug comandos");
-
-                ui.separator();
-                let before = self.codepage;
-                egui::ComboBox::from_label("Codepage")
-                    .selected_text(match self.codepage {
-                        CodePage::Utf8Lossy => "UTF-8 (lossy)",
-                        CodePage::Cp437 => "CP437",
-                        CodePage::Cp850 => "CP850",
-                        CodePage::Windows1252 => "Windows-1252",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.codepage, CodePage::Utf8Lossy, "UTF-8 (lossy)");
-                        ui.selectable_value(&mut self.codepage, CodePage::Cp437, "CP437");
-                        ui.selectable_value(&mut self.codepage, CodePage::Cp850, "CP850");
-                        ui.selectable_value(&mut self.codepage, CodePage::Windows1252, "Windows-1252");
-                    });
-                if self.codepage != before {
-                    self.reparse_all_jobs();
+                if ui.button("⚙ Configuración").clicked() {
+                    self.show_settings = true;
                 }
 
                 if let Some(job) = self.active_job() {
@@ -998,6 +1626,9 @@ impl eframe::App for EscPosViewer {
                 .interactable(true)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
+                        if ui.button("⚙ Config").clicked() {
+                            self.show_settings = true;
+                        }
                         if ui.button("Menú").clicked() {
                             self.ui_mode = UiMode::Full;
                         }
@@ -1180,18 +1811,95 @@ impl eframe::App for EscPosViewer {
                                                 }
                                                 Control::Barcode { m, data } => {
                                                     flush_pending(ui, &mut pending);
-                                                    let preview =
-                                                        String::from_utf8_lossy(data);
                                                     ui.add_space(6.0);
-                                                    ui.label(
-                                                        egui::RichText::new(format!(
-                                                            "[BARCODE m={:02X}] {}",
-                                                            m, preview
-                                                        ))
-                                                        .color(egui::Color32::BLACK)
-                                                        .monospace()
-                                                        .size(11.0),
-                                                    );
+                                                    let hri_pos = state.barcode_hri;
+                                                    let target = paper_width.min(360.0);
+                                                    if let Some((img, hri)) =
+                                                        Self::render_barcode(state, *m, data, target)
+                                                    {
+                                                        let key = Self::hash_key(&(
+                                                            "barcode",
+                                                            *m,
+                                                            data.len(),
+                                                            state.barcode_hri as u8,
+                                                            state.barcode_height,
+                                                            state.barcode_module_width,
+                                                            Self::hash_key(data),
+                                                        ));
+
+                                                        let hri_text = hri.unwrap_or_else(|| String::from_utf8_lossy(data).to_string());
+
+                                                        // Mostrar HRI arriba
+                                                        if matches!(hri_pos, BarcodeHriPosition::Above | BarcodeHriPosition::Both) {
+                                                            ui.label(
+                                                                egui::RichText::new(hri_text.clone())
+                                                                    .color(egui::Color32::BLACK)
+                                                                    .family(egui::FontFamily::Monospace)
+                                                                    .size(12.0),
+                                                            );
+                                                            ui.add_space(2.0);
+                                                        }
+
+                                                        match state.alignment {
+                                                            Align::Center => {
+                                                                ui.vertical_centered(|ui| {
+                                                                    Self::show_image_scaled(
+                                                                        ui,
+                                                                        &mut texture_cache,
+                                                                        key,
+                                                                        img,
+                                                                        target,
+                                                                    );
+                                                                });
+                                                            }
+                                                            Align::Right => {
+                                                                ui.with_layout(
+                                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                                    |ui| {
+                                                                        Self::show_image_scaled(
+                                                                            ui,
+                                                                            &mut texture_cache,
+                                                                            key,
+                                                                            img,
+                                                                            target,
+                                                                        );
+                                                                    },
+                                                                );
+                                                            }
+                                                            Align::Left => {
+                                                                Self::show_image_scaled(
+                                                                    ui,
+                                                                    &mut texture_cache,
+                                                                    key,
+                                                                    img,
+                                                                    target,
+                                                                );
+                                                            }
+                                                        }
+
+                                                        // Mostrar HRI abajo
+                                                        if matches!(hri_pos, BarcodeHriPosition::Below | BarcodeHriPosition::Both) {
+                                                            ui.add_space(2.0);
+                                                            ui.label(
+                                                                egui::RichText::new(hri_text)
+                                                                    .color(egui::Color32::BLACK)
+                                                                    .family(egui::FontFamily::Monospace)
+                                                                    .size(12.0),
+                                                            );
+                                                        }
+                                                    } else {
+                                                        // Fallback: placeholder
+                                                        let preview = String::from_utf8_lossy(data);
+                                                        ui.label(
+                                                            egui::RichText::new(format!(
+                                                                "[BARCODE m={:02X}] {}",
+                                                                m, preview
+                                                            ))
+                                                            .color(egui::Color32::BLACK)
+                                                            .monospace()
+                                                            .size(11.0),
+                                                        );
+                                                    }
                                                     ui.add_space(6.0);
                                                 }
                                                 _ => {}
@@ -1225,6 +1933,9 @@ impl eframe::App for EscPosViewer {
                 });
             });
         });
+
+        // Modal de configuración (se muestra sobre Preview o Completo).
+        self.ui_settings_modal(ctx);
 
             self.last_ui_mode = self.ui_mode;
     }

@@ -1,11 +1,20 @@
-use crate::model::{Align, CodePage, CommandType, Control, PrinterState};
+use crate::model::{Align, BarcodeHriPosition, CodePage, CommandType, Control, PrinterState};
 use oem_cp::{Cp437, Cp850, StringExt};
 
 pub type ParsedCommand = (PrinterState, CommandType);
 
 fn decode_text(bytes: &[u8], codepage: CodePage) -> String {
     match codepage {
-        CodePage::Utf8Lossy => String::from_utf8_lossy(bytes).to_string(),
+        // Muchísimos POS envían bytes tipo Windows-1252/Latin1 (p.ej. 0xA1 = '¡')
+        // y NO UTF-8. Si decodificamos como UTF-8 (lossy) sale '�'.
+        // Solución: intentar UTF-8 estricto; si falla, hacer fallback a Windows-1252.
+        CodePage::Utf8Lossy => match std::str::from_utf8(bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                let (text, _, _) = encoding_rs::WINDOWS_1252.decode(bytes);
+                text.into_owned()
+            }
+        },
         CodePage::Cp437 => String::from_cp::<Cp437>(bytes),
         CodePage::Cp850 => String::from_cp::<Cp850>(bytes),
         CodePage::Windows1252 => {
@@ -108,15 +117,62 @@ pub fn parse_escpos(data: &[u8], codepage: CodePage) -> Vec<ParsedCommand> {
                 if i + 1 < data.len() {
                     let next_byte = data[i + 1];
                     match next_byte {
-                        // Configuración común de barcode/HRI: consumir el parámetro para que no se filtre como texto.
-                        // GS H n (HRI position), GS h n (height), GS w n (width), GS f n (HRI font)
-                        0x48 | 0x68 | 0x77 | 0x66 => {
-                            commands.push((
-                                state.clone(),
-                                CommandType::Control(Control::GsUnknown(next_byte)),
-                            ));
-                            // Consumir también el byte parámetro (n) si existe.
+                        // GS H n (HRI position)
+                        0x48 => {
                             if i + 2 < data.len() {
+                                let n = data[i + 2];
+                                state.barcode_hri = match n {
+                                    1 => BarcodeHriPosition::Above,
+                                    2 => BarcodeHriPosition::Below,
+                                    3 => BarcodeHriPosition::Both,
+                                    _ => BarcodeHriPosition::None,
+                                };
+                                commands.push((
+                                    state.clone(),
+                                    CommandType::Control(Control::BarcodeHriPosition(state.barcode_hri)),
+                                ));
+                                i += 3;
+                            } else {
+                                i += 2;
+                            }
+                        }
+                        // GS h n (height)
+                        0x68 => {
+                            if i + 2 < data.len() {
+                                let n = data[i + 2];
+                                state.barcode_height = n.max(1);
+                                commands.push((
+                                    state.clone(),
+                                    CommandType::Control(Control::BarcodeHeight(state.barcode_height)),
+                                ));
+                                i += 3;
+                            } else {
+                                i += 2;
+                            }
+                        }
+                        // GS w n (module width)
+                        0x77 => {
+                            if i + 2 < data.len() {
+                                let n = data[i + 2];
+                                state.barcode_module_width = n.max(1);
+                                commands.push((
+                                    state.clone(),
+                                    CommandType::Control(Control::BarcodeModuleWidth(state.barcode_module_width)),
+                                ));
+                                i += 3;
+                            } else {
+                                i += 2;
+                            }
+                        }
+                        // GS f n (HRI font)
+                        0x66 => {
+                            if i + 2 < data.len() {
+                                let n = data[i + 2];
+                                state.barcode_hri_font = n;
+                                commands.push((
+                                    state.clone(),
+                                    CommandType::Control(Control::BarcodeHriFont(state.barcode_hri_font)),
+                                ));
                                 i += 3;
                             } else {
                                 i += 2;
@@ -410,7 +466,8 @@ mod tests {
         let texts_utf8 = collect_text(&parsed_utf8);
         assert_eq!(texts_utf8.len(), 1);
         assert_ne!(texts_utf8[0], "√¼=½");
-        assert!(texts_utf8[0].contains('\u{FFFD}'));
+        // En modo UTF-8 (auto), si no es UTF-8 válido cae a Windows-1252 y no debe emitir U+FFFD.
+        assert!(!texts_utf8[0].contains('\u{FFFD}'));
     }
 
     #[test]
@@ -422,12 +479,24 @@ mod tests {
 
         let parsed_cp850 = parse_escpos(&data, CodePage::Cp850);
         let texts_cp850 = collect_text(&parsed_cp850);
-        assert_eq!(texts_cp850, vec![expected]);
+        assert_eq!(texts_cp850, vec![expected.clone()]);
 
         let parsed_utf8 = parse_escpos(&data, CodePage::Utf8Lossy);
         let texts_utf8 = collect_text(&parsed_utf8);
         assert_eq!(texts_utf8.len(), 1);
-        assert!(texts_utf8[0].contains('\u{FFFD}'));
+        // En modo UTF-8 (auto), si no es UTF-8 válido cae a Windows-1252.
+        assert!(!texts_utf8[0].contains('\u{FFFD}'));
+        assert_ne!(texts_utf8[0], expected);
+    }
+
+    #[test]
+    fn utf8_auto_fallback_decodes_inverted_exclamation_from_cp1252() {
+        // En Windows-1252: 0xA1 = '¡'.
+        // En UTF-8 estricto esto NO es válido como byte suelto.
+        let data = [0xA1, b'G', b'r', b'a', b'c', b'i', b'a', b's'];
+        let parsed = parse_escpos(&data, CodePage::Utf8Lossy);
+        let text = collect_text(&parsed).concat();
+        assert!(text.contains("¡Gracias"));
     }
 
     #[test]
