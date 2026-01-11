@@ -11,7 +11,7 @@ use rfd::FileDialog;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::mem;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::fs;
 use std::path::Path;
 
@@ -21,10 +21,30 @@ enum UiMode {
     Full,
 }
 
-pub struct EscPosViewer {
-    raw_data: Vec<u8>,
+#[derive(Debug, Clone)]
+struct JobEntry {
+    id: u64,
+    label: String,
+    created_at: Instant,
+
+    full_bytes: Vec<u8>,
+    display_bytes: Vec<u8>,
     parsed_commands: Vec<(PrinterState, CommandType)>,
-    filepath: Option<String>,
+
+    sim_active: bool,
+    sim_started_at: Option<Instant>,
+    sim_sent: usize,
+}
+
+pub struct EscPosViewer {
+    jobs: Vec<JobEntry>,
+    active_job_idx: Option<usize>,
+    next_job_id: u64,
+
+    max_jobs: usize,
+    auto_prune_by_age: bool,
+    prune_after: Duration,
+    auto_scroll_on_print: bool,
     paper_width: PaperWidth,
     last_paper_width: PaperWidth,
     did_apply_initial_window_size: bool,
@@ -48,19 +68,20 @@ pub struct EscPosViewer {
     window: WindowControl,
 
     simulate_printing: bool,
-    sim_active: bool,
-    sim_started_at: Option<Instant>,
     sim_bytes_per_sec: usize,
-    sim_full_data: Vec<u8>,
-    sim_sent: usize,
 }
 
 impl Default for EscPosViewer {
     fn default() -> Self {
         Self {
-            raw_data: Vec::new(),
-            parsed_commands: Vec::new(),
-            filepath: None,
+            jobs: Vec::new(),
+            active_job_idx: None,
+            next_job_id: 1,
+
+            max_jobs: 25,
+            auto_prune_by_age: false,
+            prune_after: Duration::from_secs(60 * 60 * 2),
+            auto_scroll_on_print: true,
             paper_width: PaperWidth::W58mm,
             last_paper_width: PaperWidth::W58mm,
             did_apply_initial_window_size: false,
@@ -83,16 +104,197 @@ impl Default for EscPosViewer {
             window: WindowControl::default(),
 
             simulate_printing: true,
-            sim_active: false,
-            sim_started_at: None,
             sim_bytes_per_sec: 1_000,
-            sim_full_data: Vec::new(),
-            sim_sent: 0,
         }
     }
 }
 
 impl EscPosViewer {
+    fn format_age_short(d: Duration) -> String {
+        let secs = d.as_secs();
+        if secs < 60 {
+            return format!("{}s", secs);
+        }
+        let mins = secs / 60;
+        if mins < 60 {
+            return format!("{}m", mins);
+        }
+        let hours = mins / 60;
+        format!("{}h", hours)
+    }
+
+    fn ui_job_tabs(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("🧹 Limpiar historial").clicked() {
+                self.jobs.clear();
+                self.active_job_idx = None;
+            }
+
+            ui.checkbox(&mut self.auto_scroll_on_print, "Auto-scroll al imprimir");
+
+            ui.add(egui::Slider::new(&mut self.max_jobs, 1..=100).text("Máx jobs"));
+
+            ui.checkbox(&mut self.auto_prune_by_age, "Autolimpieza por edad");
+            if self.auto_prune_by_age {
+                let mut mins = (self.prune_after.as_secs() / 60).max(1);
+                ui.add(egui::Slider::new(&mut mins, 1..=24 * 60).text("min"));
+                self.prune_after = Duration::from_secs(mins * 60);
+            }
+        });
+
+        if self.jobs.is_empty() {
+            ui.label(egui::RichText::new("(sin trabajos aún)").weak());
+            return;
+        }
+
+        let mut to_close: Option<usize> = None;
+        egui::ScrollArea::horizontal()
+            .id_salt("job_tabs_scroll")
+            .max_height(34.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let now = Instant::now();
+                    for (idx, job) in self.jobs.iter().enumerate() {
+                        let selected = self.active_job_idx == Some(idx);
+                        let age = now.duration_since(job.created_at);
+                        let mut title = job.label.clone();
+                        const MAX: usize = 26;
+                        if title.chars().count() > MAX {
+                            title = title.chars().take(MAX).collect::<String>();
+                            title.push('…');
+                        }
+
+                        let tab_text = format!(
+                            "#{} {} ({} · {}b)",
+                            job.id,
+                            title,
+                            Self::format_age_short(age),
+                            job.full_bytes.len()
+                        );
+
+                        if ui.selectable_label(selected, tab_text).clicked() {
+                            self.active_job_idx = Some(idx);
+                        }
+
+                        if ui.small_button("✕").on_hover_text("Cerrar").clicked() {
+                            to_close = Some(idx);
+                        }
+                    }
+                });
+            });
+
+        if let Some(idx) = to_close {
+            self.jobs.remove(idx);
+            if self.jobs.is_empty() {
+                self.active_job_idx = None;
+            } else if let Some(active) = self.active_job_idx {
+                if idx == active {
+                    self.active_job_idx = Some(active.saturating_sub(1).min(self.jobs.len() - 1));
+                } else if idx < active {
+                    self.active_job_idx = Some(active - 1);
+                }
+            }
+        }
+    }
+    fn active_job(&self) -> Option<&JobEntry> {
+        self.active_job_idx
+            .and_then(|idx| self.jobs.get(idx))
+    }
+
+    fn active_job_mut(&mut self) -> Option<&mut JobEntry> {
+        let idx = self.active_job_idx?;
+        self.jobs.get_mut(idx)
+    }
+
+    fn stop_active_simulation_show_full(&mut self) {
+        let codepage = self.codepage;
+        let Some(job) = self.active_job_mut() else {
+            return;
+        };
+        if !job.sim_active {
+            return;
+        }
+        job.sim_active = false;
+        job.sim_started_at = None;
+        job.display_bytes = job.full_bytes.clone();
+        job.parsed_commands = parse_escpos(&job.display_bytes, codepage);
+        job.sim_sent = job.display_bytes.len();
+    }
+
+    fn prune_jobs(&mut self) {
+        let active_id = self.active_job().map(|j| j.id);
+
+        if self.jobs.is_empty() {
+            self.active_job_idx = None;
+            return;
+        }
+
+        // Primero por edad (opcional)
+        if self.auto_prune_by_age {
+            let now = Instant::now();
+            self.jobs.retain(|j| now.duration_since(j.created_at) <= self.prune_after);
+        }
+
+        // Luego por límite de cantidad (siempre)
+        if self.jobs.len() > self.max_jobs {
+            let remove_count = self.jobs.len() - self.max_jobs;
+            self.jobs.drain(0..remove_count);
+        }
+
+        // Reajustar active_job_idx intentando mantener el mismo id.
+        if self.jobs.is_empty() {
+            self.active_job_idx = None;
+            return;
+        }
+
+        if let Some(id) = active_id {
+            if let Some(idx) = self.jobs.iter().position(|j| j.id == id) {
+                self.active_job_idx = Some(idx);
+                return;
+            }
+        }
+
+        self.active_job_idx = Some(self.jobs.len() - 1);
+    }
+
+    fn push_new_job(&mut self, label: String, full_data: Vec<u8>) {
+        // Si hay una simulación activa, la cerramos mostrando el job completo.
+        self.stop_active_simulation_show_full();
+
+        let id = self.next_job_id;
+        self.next_job_id = self.next_job_id.saturating_add(1);
+
+        let mut job = JobEntry {
+            id,
+            label,
+            created_at: Instant::now(),
+            full_bytes: full_data,
+            display_bytes: Vec::new(),
+            parsed_commands: Vec::new(),
+            sim_active: false,
+            sim_started_at: None,
+            sim_sent: 0,
+        };
+
+        if self.simulate_printing {
+            job.sim_active = true;
+            job.sim_started_at = Some(Instant::now());
+            job.display_bytes = Vec::with_capacity(job.full_bytes.len());
+            job.parsed_commands.clear();
+            job.sim_sent = 0;
+        } else {
+            job.display_bytes = job.full_bytes.clone();
+            job.parsed_commands = parse_escpos(&job.display_bytes, self.codepage);
+            job.sim_sent = job.display_bytes.len();
+        }
+
+        self.jobs.push(job);
+        self.active_job_idx = Some(self.jobs.len() - 1);
+        self.prune_jobs();
+    }
+
     fn target_window_width_px(paper_width: PaperWidth) -> f32 {
         match paper_width {
             PaperWidth::W58mm => 375.0,
@@ -170,56 +372,33 @@ impl EscPosViewer {
         }
     }
 
-    fn load_bytes(&mut self, filepath: Option<String>, data: Vec<u8>) {
-        self.filepath = filepath;
-        self.parsed_commands = parse_escpos(&data, self.codepage);
-        self.raw_data = data;
-    }
-
-    fn start_simulation(&mut self, filepath: Option<String>, full_data: Vec<u8>) {
-        self.filepath = filepath;
-        self.sim_active = true;
-        self.sim_started_at = Some(Instant::now());
-        self.sim_full_data = full_data;
-        self.sim_sent = 0;
-
-        self.raw_data = Vec::with_capacity(self.sim_full_data.len());
-        self.parsed_commands.clear();
-    }
-
-    fn stop_simulation_show_full(&mut self) {
-        if !self.sim_active {
-            return;
-        }
-        self.sim_active = false;
-        self.sim_started_at = None;
-        self.raw_data = self.sim_full_data.clone();
-        self.parsed_commands = parse_escpos(&self.raw_data, self.codepage);
-        self.sim_sent = self.raw_data.len();
-    }
-
     fn tick_simulation(&mut self) {
-        if !self.sim_active {
+        let bytes_per_sec = self.sim_bytes_per_sec;
+        let codepage = self.codepage;
+        let Some(job) = self.active_job_mut() else {
+            return;
+        };
+        if !job.sim_active {
             return;
         }
-        let Some(start) = self.sim_started_at else {
+        let Some(start) = job.sim_started_at else {
             return;
         };
 
         let elapsed = start.elapsed().as_secs_f32();
-        let target = (elapsed * self.sim_bytes_per_sec as f32) as usize;
-        let target = target.min(self.sim_full_data.len());
+        let target = (elapsed * bytes_per_sec as f32) as usize;
+        let target = target.min(job.full_bytes.len());
 
-        if target > self.sim_sent {
-            self.raw_data
-                .extend_from_slice(&self.sim_full_data[self.sim_sent..target]);
-            self.sim_sent = target;
-            self.parsed_commands = parse_escpos(&self.raw_data, self.codepage);
+        if target > job.sim_sent {
+            job.display_bytes
+                .extend_from_slice(&job.full_bytes[job.sim_sent..target]);
+            job.sim_sent = target;
+            job.parsed_commands = parse_escpos(&job.display_bytes, codepage);
         }
 
-        if self.sim_sent >= self.sim_full_data.len() {
-            self.sim_active = false;
-            self.sim_started_at = None;
+        if job.sim_sent >= job.full_bytes.len() {
+            job.sim_active = false;
+            job.sim_started_at = None;
         }
     }
 
@@ -249,16 +428,18 @@ impl EscPosViewer {
 
     fn try_load_path(&mut self, path: &Path) {
         if let Ok(data) = fs::read(path) {
-            self.load_bytes(Some(path.display().to_string()), data);
+            self.push_new_job(path.display().to_string(), data);
         }
     }
 
-    fn reparse(&mut self) {
-        if self.raw_data.is_empty() {
-            self.parsed_commands.clear();
-            return;
+    fn reparse_all_jobs(&mut self) {
+        for job in &mut self.jobs {
+            if job.display_bytes.is_empty() {
+                job.parsed_commands.clear();
+                continue;
+            }
+            job.parsed_commands = parse_escpos(&job.display_bytes, self.codepage);
         }
-        self.parsed_commands = parse_escpos(&self.raw_data, self.codepage);
     }
 
     fn debug_label_for_control(control: &Control) -> String {
@@ -591,10 +772,13 @@ impl eframe::App for EscPosViewer {
         }
 
         self.tick_simulation();
-        if self.sim_active {
+        if self.active_job().is_some_and(|j| j.sim_active) {
             // Forzar repaints para animar la simulación.
             ctx.request_repaint();
         }
+
+        // Autolimpieza / límites del historial.
+        self.prune_jobs();
 
         // Mantener el listener TCP 9100 sincronizado con el checkbox.
         // Evita reintentos automáticos constantes si el puerto está ocupado.
@@ -609,13 +793,9 @@ impl eframe::App for EscPosViewer {
         // Captura TCP (impresora virtual 9100)
         if let Some(cap) = &self.tcp_capture {
             let jobs = cap.try_recv_all();
-            if let Some(job) = jobs.last() {
-                let label = Some(format!("TCP 9100 ({})", job.source));
-                if self.simulate_printing {
-                    self.start_simulation(label, job.bytes.clone());
-                } else {
-                    self.load_bytes(label, job.bytes.clone());
-                }
+            for job in jobs {
+                let label = format!("TCP 9100 ({})", job.source);
+                self.push_new_job(label, job.bytes);
 
                 // Si estaba oculto a la bandeja, el hilo TCP ya lo re-muestra (Windows).
                 self.hidden_to_tray = false;
@@ -685,18 +865,20 @@ impl eframe::App for EscPosViewer {
                 ui.checkbox(&mut self.simulate_printing, "Simular impresión");
                 if before_sim && !self.simulate_printing {
                     // Si el usuario desactiva en medio de la simulación, mostramos todo.
-                    self.stop_simulation_show_full();
+                    self.stop_active_simulation_show_full();
                 }
                 ui.add(
                     egui::Slider::new(&mut self.sim_bytes_per_sec, 1_000..=200_000)
                         .text("bytes/s"),
                 );
-                if self.sim_active {
-                    let total = self.sim_full_data.len().max(1);
-                    let pct = (self.sim_sent as f32 / total as f32) * 100.0;
+                if let Some(job) = self.active_job() {
+                    if job.sim_active {
+                        let total = job.full_bytes.len().max(1);
+                        let pct = (job.sim_sent as f32 / total as f32) * 100.0;
                     ui.label(egui::RichText::new(format!("{pct:.0}%"))
                         .color(egui::Color32::DARK_GRAY)
                         .small());
+                    }
                 }
 
                 ui.separator();
@@ -723,14 +905,17 @@ impl eframe::App for EscPosViewer {
                         ui.selectable_value(&mut self.codepage, CodePage::Windows1252, "Windows-1252");
                     });
                 if self.codepage != before {
-                    self.reparse();
+                    self.reparse_all_jobs();
                 }
 
-                if let Some(path) = &self.filepath {
+                if let Some(job) = self.active_job() {
                     ui.separator();
-                    ui.label(egui::RichText::new(format!("📄 {}", path)).weak());
+                    ui.label(egui::RichText::new(format!("📄 {}", job.label)).weak());
                 }
                 });
+
+                // Barra de jobs (historial / pestañas)
+                self.ui_job_tabs(ui);
             });
         }
 
@@ -749,7 +934,11 @@ impl eframe::App for EscPosViewer {
                             egui::ScrollArea::vertical()
                                 .id_salt("hex_scroll")
                                 .show(ui, |ui| {
-                                    ui.monospace(pretty_hex(&self.raw_data));
+                                    if let Some(job) = self.active_job() {
+                                        ui.monospace(pretty_hex(&job.display_bytes));
+                                    } else {
+                                        ui.monospace("(sin datos)");
+                                    }
                                 });
                         });
 
@@ -761,8 +950,12 @@ impl eframe::App for EscPosViewer {
                             egui::ScrollArea::vertical()
                                 .id_salt("cmd_scroll")
                                 .show(ui, |ui| {
+                                    let Some(job) = self.active_job() else {
+                                        ui.label(egui::RichText::new("(sin comandos)").weak());
+                                        return;
+                                    };
                                     for (idx, (_state, cmd)) in
-                                        self.parsed_commands.iter().enumerate()
+                                        job.parsed_commands.iter().enumerate()
                                     {
                                         let line = match cmd {
                                             CommandType::Text(text) => {
@@ -814,9 +1007,16 @@ impl eframe::App for EscPosViewer {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("render_scroll")
-                .show(ui, |ui| {
+            let (job_id, stick_bottom) = match self.active_job() {
+                Some(j) => (j.id, self.auto_scroll_on_print && j.sim_active),
+                None => (0, false),
+            };
+
+            ui.push_id(job_id, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("render_scroll")
+                    .stick_to_bottom(stick_bottom)
+                    .show(ui, |ui| {
                     let desired: f32 = match self.paper_width {
                         PaperWidth::W58mm => 300.0,
                         PaperWidth::W80mm => 450.0,
@@ -838,6 +1038,16 @@ impl eframe::App for EscPosViewer {
 
                                 let mut texture_cache = mem::take(&mut self.texture_cache);
 
+                                let Some(job) = self.active_job() else {
+                                    ui.label(
+                                        egui::RichText::new("Arrastra un .prn/.bin o imprime por TCP 9100")
+                                            .color(egui::Color32::GRAY)
+                                            .size(12.0),
+                                    );
+                                    self.texture_cache = texture_cache;
+                                    return;
+                                };
+
                                 let mut pending: Option<(PrinterState, String)> = None;
                                 let flush_pending = |ui: &mut egui::Ui,
                                                      pending: &mut Option<(PrinterState, String)>| {
@@ -853,7 +1063,7 @@ impl eframe::App for EscPosViewer {
                                     }
                                 };
 
-                                for (state, cmd) in &self.parsed_commands {
+                                for (state, cmd) in &job.parsed_commands {
                                     match cmd {
                                         CommandType::Text(text) => match &mut pending {
                                             Some((ps, buf))
@@ -996,9 +1206,11 @@ impl eframe::App for EscPosViewer {
                                 self.texture_cache = texture_cache;
                             });
 
-                        if self.sim_active && !self.sim_full_data.is_empty() {
-                            let progress = self.sim_sent as f32 / self.sim_full_data.len() as f32;
+                        if let Some(job) = self.active_job() {
+                            if job.sim_active && !job.full_bytes.is_empty() {
+                                let progress = job.sim_sent as f32 / job.full_bytes.len() as f32;
                             Self::draw_printing_reveal_effect(ui, ticket.response.rect, progress);
+                            }
                         }
 
                         if self.ui_mode == UiMode::Preview {
@@ -1011,6 +1223,7 @@ impl eframe::App for EscPosViewer {
                         }
                     });
                 });
+            });
         });
 
             self.last_ui_mode = self.ui_mode;
