@@ -30,6 +30,7 @@ pub fn parse_escpos(data: &[u8], codepage: CodePage) -> Vec<ParsedCommand> {
     let mut i = 0;
 
     let mut state = PrinterState::default();
+    let mut active_codepage = codepage;
 
     // Estado QR (GS ( k): se arma con Store, y se emite en Print.
     let mut qr_model: u8 = 2; // 1 o 2 (default: 2)
@@ -94,6 +95,34 @@ pub fn parse_escpos(data: &[u8], codepage: CodePage) -> Vec<ParsedCommand> {
                                     state.clone(),
                                     CommandType::Control(Control::Align(state.alignment)),
                                 ));
+                                i += 3;
+                            } else {
+                                i += 2;
+                            }
+                        }
+                        0x74 => {
+                            // ESC t n (selección de code table / codepage)
+                            // Mapeo común (Epson): 0=CP437, 2=CP850, 16=Windows-1252.
+                            if i + 2 < data.len() {
+                                let n = data[i + 2];
+                                if let Some(mapped) = match n {
+                                    0 => Some(CodePage::Cp437),
+                                    2 => Some(CodePage::Cp850),
+                                    16 => Some(CodePage::Windows1252),
+                                    _ => None,
+                                } {
+                                    active_codepage = mapped;
+                                    commands.push((
+                                        state.clone(),
+                                        CommandType::Control(Control::CodePage(mapped)),
+                                    ));
+                                } else {
+                                    // Consumimos igualmente para no filtrar el parámetro como texto.
+                                    commands.push((
+                                        state.clone(),
+                                        CommandType::Control(Control::EscUnknown(next_byte)),
+                                    ));
+                                }
                                 i += 3;
                             } else {
                                 i += 2;
@@ -394,7 +423,7 @@ pub fn parse_escpos(data: &[u8], codepage: CodePage) -> Vec<ParsedCommand> {
                 }
 
                 if !text_bytes.is_empty() {
-                    let text = decode_text(&text_bytes, codepage);
+                    let text = decode_text(&text_bytes, active_codepage);
                     commands.push((state.clone(), CommandType::Text(text)));
                     i = j;
                 } else {
@@ -497,6 +526,17 @@ mod tests {
         let parsed = parse_escpos(&data, CodePage::Utf8Lossy);
         let text = collect_text(&parsed).concat();
         assert!(text.contains("¡Gracias"));
+    }
+
+    #[test]
+    fn esc_t_selects_windows1252_for_subsequent_text() {
+        // ESC t 16 (Windows-1252) seguido de 0xA1 ('¡') debe decodificar correctamente.
+        let data = [0x1B, 0x74, 0x10, 0xA1, b'H', b'o', b'l', b'a'];
+        // Arrancamos con un codepage distinto para asegurar que el cambio ocurre.
+        let parsed = parse_escpos(&data, CodePage::Cp437);
+        let text = collect_text(&parsed).concat();
+        assert!(text.contains("¡Hola"));
+        assert!(parsed.iter().any(|(_, c)| matches!(c, CommandType::Control(Control::CodePage(CodePage::Windows1252)))));
     }
 
     #[test]

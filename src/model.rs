@@ -11,6 +11,8 @@ pub enum Control {
     Init,
     Bold(bool),
     Align(Align),
+    /// Cambio de tabla de caracteres (ESC t n) interpretado a CodePage.
+    CodePage(CodePage),
     /// Raw size byte as received by GS ! n.
     Size { raw: u8, width: u8, height: u8 },
     Cut,

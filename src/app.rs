@@ -636,6 +636,7 @@ impl EscPosViewer {
             Control::Init => "ESC @ (INIT)".to_string(),
             Control::Bold(on) => format!("ESC E (BOLD={})", on),
             Control::Align(align) => format!("ESC a (ALIGN={:?})", align),
+            Control::CodePage(cp) => format!("ESC t (CODEPAGE={:?})", cp),
             Control::Size { raw, width, height } => {
                 format!("GS ! (SIZE raw={:02X} w={} h={})", raw, width, height)
             }
