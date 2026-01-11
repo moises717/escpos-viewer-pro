@@ -16,6 +16,16 @@ Flujo:
 - En el repo: Settings → Actions → General → **Workflow permissions** → habilitar
 	“Read and write permissions” y permitir crear PRs.
 
+## Auto-merge (opcional)
+
+Este repo incluye el workflow [​.github/workflows/auto-merge-release-plz.yml](.github/workflows/auto-merge-release-plz.yml) que habilita
+automáticamente el **auto-merge** para PRs de release-plz (ramas `release-plz-*`).
+
+Para que funcione, habilita en GitHub:
+- Settings → General → Pull Requests → **Allow auto-merge**
+
+Luego, cuando el CI esté en verde, GitHub mergea el Release PR sin intervención.
+
 ## Notas
 
 - El instalador toma la versión desde el tag (CI pasa `/DMyAppVersion=...` a Inno Setup), así que no tienes que editar `setup.iss` manualmente.
