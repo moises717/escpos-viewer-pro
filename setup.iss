@@ -6,7 +6,7 @@
 ; CI puede sobreescribir esta constante con:
 ;   ISCC setup.iss /DMyAppVersion=1.2.3
 #ifndef MyAppVersion
-	#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.0.0"
 #endif
 
 #define MyAppPublisher "escpos_viewer"

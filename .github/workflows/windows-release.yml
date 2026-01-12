@@ -32,11 +32,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build (release)
+        if: steps.vars.outputs.has_tag == 'true'
         shell: pwsh
         run: |
           cargo build --release
 
       - name: Install Inno Setup (Chocolatey)
+        if: steps.vars.outputs.has_tag == 'true'
         shell: pwsh
         run: |
           choco install innosetup -y --no-progress
@@ -45,22 +47,34 @@ jobs:
         id: vars
         shell: pwsh
         run: |
+          $tag = $null
+
           if ("${{ github.event_name }}" -eq "workflow_run") {
             $tag = (git tag --points-at HEAD --list "v*" | Select-Object -First 1)
-            if (-not $tag) {
-              Write-Host "No v* tag on this commit; skipping windows release."
-              exit 0
-            }
-            $v = $tag
           } else {
-            $v = "${{ github.ref_name }}"
+            $tag = "${{ github.ref_name }}"
+            if (-not $tag.StartsWith('v')) {
+              # workflow_dispatch en branch, etc.
+              $tag = $null
+            }
           }
 
+          if (-not $tag) {
+            "has_tag=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            Write-Host "No v* tag available; skipping windows release steps."
+            exit 0
+          }
+
+          $v = $tag
           if ($v.StartsWith('v')) { $v = $v.Substring(1) }
           if ([string]::IsNullOrWhiteSpace($v)) { throw "Version empty" }
+
+          "has_tag=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Build installer (setup.iss)
+        if: steps.vars.outputs.has_tag == 'true'
         shell: pwsh
         run: |
           $iscc = "C:\\Program Files (x86)\\Inno Setup 6\\ISCC.exe"
@@ -70,6 +84,7 @@ jobs:
           & $iscc "setup.iss" "/DMyAppVersion=${{ steps.vars.outputs.version }}"
 
       - name: Verify outputs
+        if: steps.vars.outputs.has_tag == 'true'
         shell: pwsh
         run: |
           $portable = "target\\release\\escpos_viewer.exe"
@@ -79,9 +94,11 @@ jobs:
           Get-Item $portable, $installer | Format-List FullName, Length, LastWriteTime
 
       - name: GitHub Release
+        if: steps.vars.outputs.has_tag == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          name: "${{ github.ref_name }}"
+          tag_name: "${{ steps.vars.outputs.tag }}"
+          name: "${{ steps.vars.outputs.tag }}"
           generate_release_notes: true
           files: |
             target/release/escpos_viewer.exe
