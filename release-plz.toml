@@ -2,8 +2,8 @@
 # No publicamos a crates.io: solo bump de versión + tag + changelog.
 publish = false
 
-# Deja que el workflow existente (windows-release.yml) cree el GitHub Release con artefactos.
-git_release_enable = false
+# Habilitar creación de GitHub Release con tag automático
+git_release_enable = true
 
 # Nuestro pipeline ya está basado en tags v*.
 git_tag_name = "v{{ version }}"
