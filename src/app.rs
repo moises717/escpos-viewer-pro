@@ -1,6 +1,8 @@
 use crate::escpos::parse_escpos;
 use crate::hex_dump::pretty_hex;
-use crate::model::{Align, BarcodeHriPosition, CodePage, CommandType, Control, PaperWidth, PrinterState};
+use crate::model::{
+    Align, BarcodeHriPosition, CodePage, CommandType, Control, PaperWidth, PrinterState,
+};
 use crate::tcp_capture::TcpCapture;
 use crate::tray::SystemTray;
 use crate::window_control::WindowControl;
@@ -9,11 +11,11 @@ use qrcode::types::Color;
 use qrcode::{EcLevel, QrCode};
 use rfd::FileDialog;
 use std::collections::HashMap;
+use std::fs;
 use std::hash::{Hash, Hasher};
 use std::mem;
-use std::time::{Duration, Instant};
-use std::fs;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UiMode {
@@ -72,6 +74,10 @@ pub struct EscPosViewer {
 
     simulate_printing: bool,
     sim_bytes_per_sec: usize,
+
+    // Realistic thermal paper effects
+    realistic_effects: bool,
+    use_thermal_font: bool,
 }
 
 impl Default for EscPosViewer {
@@ -111,6 +117,9 @@ impl Default for EscPosViewer {
 
             simulate_printing: true,
             sim_bytes_per_sec: 1_000,
+
+            realistic_effects: true,
+            use_thermal_font: true,
         }
     }
 }
@@ -280,17 +289,25 @@ impl EscPosViewer {
                                 }
                             }
                             if let Some(err) = &self.tcp_last_error {
-                                ui.label(egui::RichText::new(err).color(egui::Color32::RED).small());
+                                ui.label(
+                                    egui::RichText::new(err).color(egui::Color32::RED).small(),
+                                );
                             } else {
                                 ui.label(egui::RichText::new("127.0.0.1:9100").weak().small());
                             }
 
                             ui.add_space(4.0);
-                            ui.checkbox(&mut self.ignore_noise_jobs, "Ignorar jobs pequeños (ruido)");
+                            ui.checkbox(
+                                &mut self.ignore_noise_jobs,
+                                "Ignorar jobs pequeños (ruido)",
+                            );
                             if self.ignore_noise_jobs {
                                 ui.add(
-                                    egui::Slider::new(&mut self.ignore_noise_jobs_max_bytes, 8..=128)
-                                        .text("bytes"),
+                                    egui::Slider::new(
+                                        &mut self.ignore_noise_jobs_max_bytes,
+                                        8..=128,
+                                    )
+                                    .text("bytes"),
                                 );
                             }
                         });
@@ -342,10 +359,26 @@ impl EscPosViewer {
                                     CodePage::Windows1252 => "Windows-1252",
                                 })
                                 .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut self.codepage, CodePage::Utf8Lossy, "UTF-8 (auto: fallback Win-1252)");
-                                    ui.selectable_value(&mut self.codepage, CodePage::Cp437, "CP437");
-                                    ui.selectable_value(&mut self.codepage, CodePage::Cp850, "CP850");
-                                    ui.selectable_value(&mut self.codepage, CodePage::Windows1252, "Windows-1252");
+                                    ui.selectable_value(
+                                        &mut self.codepage,
+                                        CodePage::Utf8Lossy,
+                                        "UTF-8 (auto: fallback Win-1252)",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.codepage,
+                                        CodePage::Cp437,
+                                        "CP437",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.codepage,
+                                        CodePage::Cp850,
+                                        "CP850",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.codepage,
+                                        CodePage::Windows1252,
+                                        "Windows-1252",
+                                    );
                                 });
                             if self.codepage != before {
                                 self.reparse_all_jobs();
@@ -369,8 +402,33 @@ impl EscPosViewer {
                                     self.jobs.clear();
                                     self.active_job_idx = None;
                                 }
-                                ui.label(egui::RichText::new(format!("Jobs: {}", self.jobs.len())).weak());
+                                ui.label(
+                                    egui::RichText::new(format!("Jobs: {}", self.jobs.len()))
+                                        .weak(),
+                                );
                             });
+                        });
+                        ui.end_row();
+
+                        // Apariencia
+                        ui.label(egui::RichText::new("Apariencia").strong());
+                        ui.vertical(|ui| {
+                            ui.checkbox(&mut self.realistic_effects, "🎫 Ticket realista");
+                            if self.realistic_effects {
+                                ui.label(
+                                    egui::RichText::new("Bordes ondulados, textura, sombra curvada")
+                                        .weak()
+                                        .small(),
+                                );
+                            }
+                            ui.checkbox(&mut self.use_thermal_font, "🔤 Fuente térmica");
+                            if self.use_thermal_font {
+                                ui.label(
+                                    egui::RichText::new("DotMatrix (estilo impresora)")
+                                        .weak()
+                                        .small(),
+                                );
+                            }
                         });
                         ui.end_row();
 
@@ -387,8 +445,7 @@ impl EscPosViewer {
         self.show_settings = open;
     }
     fn active_job(&self) -> Option<&JobEntry> {
-        self.active_job_idx
-            .and_then(|idx| self.jobs.get(idx))
+        self.active_job_idx.and_then(|idx| self.jobs.get(idx))
     }
 
     fn active_job_mut(&mut self) -> Option<&mut JobEntry> {
@@ -422,7 +479,8 @@ impl EscPosViewer {
         // Primero por edad (opcional)
         if self.auto_prune_by_age {
             let now = Instant::now();
-            self.jobs.retain(|j| now.duration_since(j.created_at) <= self.prune_after);
+            self.jobs
+                .retain(|j| now.duration_since(j.created_at) <= self.prune_after);
         }
 
         // Luego por límite de cantidad (siempre)
@@ -502,6 +560,161 @@ impl EscPosViewer {
         )));
     }
 
+    // ===== REALISTIC THERMAL PAPER EFFECTS =====
+
+    /// Color del papel térmico (crema sutil en lugar de blanco puro)
+    const THERMAL_PAPER_COLOR: egui::Color32 = egui::Color32::from_rgb(254, 250, 245);
+
+    /// Dibuja el borde superior dentado (efecto de papel arrancado del rollo)
+    fn draw_torn_paper_edge(painter: &egui::Painter, rect: egui::Rect, _paper_color: egui::Color32) {
+        let wave_height = 4.0;
+        let num_teeth = 25;
+        let tooth_width = rect.width() / num_teeth as f32;
+        
+        // Color gris para simular el borde irregular del papel
+        let edge_color = egui::Color32::from_gray(230);
+        let shadow_color = egui::Color32::from_gray(200);
+        
+        // Dibujar dientes triangulares en el borde superior
+        for i in 0..num_teeth {
+            let x_start = rect.left() + i as f32 * tooth_width;
+            let x_mid = x_start + tooth_width / 2.0;
+            let x_end = x_start + tooth_width;
+            
+            // Variación en altura para irregularidad
+            let height_var = ((i as f32 * 1.7).sin() * 0.5 + 0.5) * wave_height;
+            
+            // Triángulo del diente
+            let points = vec![
+                egui::pos2(x_start, rect.top()),
+                egui::pos2(x_mid, rect.top() - height_var - 2.0),
+                egui::pos2(x_end, rect.top()),
+            ];
+            
+            painter.add(egui::Shape::convex_polygon(
+                points.clone(),
+                edge_color,
+                egui::Stroke::new(0.5, shadow_color),
+            ));
+        }
+        
+        // Línea de sombra sutil debajo del borde dentado
+        painter.line_segment(
+            [egui::pos2(rect.left(), rect.top() + 1.0), egui::pos2(rect.right(), rect.top() + 1.0)],
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 15)),
+        );
+    }
+
+    /// Dibuja la línea de corte (guillotina) en la parte inferior
+    fn draw_cut_line(painter: &egui::Painter, rect: egui::Rect) {
+        let y = rect.bottom() + 8.0;
+        let dash_length = 8.0;
+        let gap_length = 4.0;
+        let color = egui::Color32::from_gray(180);
+
+        let mut x = rect.left();
+        let mut is_dash = true;
+
+        while x < rect.right() {
+            if is_dash {
+                let end_x = (x + dash_length).min(rect.right());
+                painter.line_segment(
+                    [egui::pos2(x, y), egui::pos2(end_x, y)],
+                    egui::Stroke::new(1.5, color),
+                );
+                x = end_x;
+            } else {
+                x += gap_length;
+            }
+            is_dash = !is_dash;
+        }
+
+        // Símbolo de tijeras
+        let scissors_x = rect.left() - 15.0;
+        painter.text(
+            egui::pos2(scissors_x, y),
+            egui::Align2::CENTER_CENTER,
+            "✂",
+            egui::FontId::proportional(12.0),
+            egui::Color32::from_gray(140),
+        );
+    }
+
+    /// Dibuja textura de papel sutil (ruido/grano)
+    fn draw_paper_texture(painter: &egui::Painter, rect: egui::Rect) {
+        // Puntos sutiles para simular textura de papel térmico
+        let dot_spacing = 15.0;
+        let dot_color = egui::Color32::from_rgba_unmultiplied(200, 195, 190, 25);
+
+        let mut y = rect.top() + 5.0;
+        let mut row = 0;
+        while y < rect.bottom() {
+            let mut x = rect.left() + 5.0 + (row % 2) as f32 * (dot_spacing / 2.0);
+            while x < rect.right() {
+                // Variación sutil en posición
+                let offset_x = ((x * 0.1).sin() * 2.0) as f32;
+                let offset_y = ((y * 0.1).cos() * 2.0) as f32;
+                painter.circle_filled(egui::pos2(x + offset_x, y + offset_y), 0.5, dot_color);
+                x += dot_spacing;
+            }
+            y += dot_spacing;
+            row += 1;
+        }
+    }
+
+    /// Dibuja indicador de fin de rollo (línea rosa/roja en el costado)
+    fn draw_end_of_roll_indicator(painter: &egui::Painter, rect: egui::Rect, ticket_height: f32) {
+        // Solo mostrar si el ticket es "largo" (> 600px de contenido)
+        if ticket_height < 600.0 {
+            return;
+        }
+
+        // Línea vertical rosa en el costado derecho
+        let indicator_color = egui::Color32::from_rgb(255, 182, 193); // Light pink
+        let stripe_width = 3.0;
+
+        let indicator_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.right() - stripe_width - 2.0, rect.top() + 10.0),
+            egui::pos2(rect.right() - 2.0, rect.bottom() - 10.0),
+        );
+
+        painter.rect_filled(indicator_rect, 1.0, indicator_color);
+    }
+
+    /// Crea una sombra curvada más realista para el ticket
+    fn get_curved_shadow() -> egui::Shadow {
+        egui::Shadow {
+            offset: egui::vec2(4.0, 6.0),
+            blur: 16.0,
+            spread: 0.0,
+            color: egui::Color32::from_black_alpha(40),
+        }
+    }
+
+    /// Dibuja efecto de imperfecciones sutiles (opcional)
+    fn draw_print_imperfections(painter: &egui::Painter, rect: egui::Rect) {
+        // Manchas muy sutiles y aleatorias (deterministas basadas en posición)
+        let imperfection_color = egui::Color32::from_rgba_unmultiplied(180, 175, 170, 15);
+
+        // Solo unas pocas manchas
+        let positions = [
+            (0.23, 0.15),
+            (0.67, 0.34),
+            (0.12, 0.78),
+            (0.89, 0.56),
+            (0.45, 0.92),
+        ];
+
+        for (tx, ty) in positions {
+            let x = egui::lerp(rect.left()..=rect.right(), tx);
+            let y = egui::lerp(rect.top()..=rect.bottom(), ty);
+            let size = 1.5 + (tx * ty * 3.0);
+            painter.circle_filled(egui::pos2(x, y), size, imperfection_color);
+        }
+    }
+
+    // ===== END REALISTIC EFFECTS =====
+
     fn draw_printing_reveal_effect(ui: &mut egui::Ui, ticket_rect: egui::Rect, progress: f32) {
         let progress = progress.max(0.0).min(1.0);
 
@@ -512,12 +725,8 @@ impl EscPosViewer {
 
         // Máscara sutil debajo de la barra (zona aún "no impresa").
         let mask_base = ui.visuals().faint_bg_color;
-        let mask = egui::Color32::from_rgba_unmultiplied(
-            mask_base.r(),
-            mask_base.g(),
-            mask_base.b(),
-            110,
-        );
+        let mask =
+            egui::Color32::from_rgba_unmultiplied(mask_base.r(), mask_base.g(), mask_base.b(), 110);
         let mask_rect = egui::Rect::from_min_max(
             egui::pos2(ticket_rect.left(), y),
             egui::pos2(ticket_rect.right(), ticket_rect.bottom()),
@@ -527,16 +736,15 @@ impl EscPosViewer {
         // Barra de "escaneo".
         let bar_h = 6.0;
         let bar_base = ui.visuals().selection.bg_fill;
-        let bar = egui::Color32::from_rgba_unmultiplied(
-            bar_base.r(),
-            bar_base.g(),
-            bar_base.b(),
-            220,
-        );
+        let bar =
+            egui::Color32::from_rgba_unmultiplied(bar_base.r(), bar_base.g(), bar_base.b(), 220);
 
         let bar_rect = egui::Rect::from_min_max(
             egui::pos2(ticket_rect.left(), (y - bar_h * 0.5).max(ticket_rect.top())),
-            egui::pos2(ticket_rect.right(), (y + bar_h * 0.5).min(ticket_rect.bottom())),
+            egui::pos2(
+                ticket_rect.right(),
+                (y + bar_h * 0.5).min(ticket_rect.bottom()),
+            ),
         );
         painter.rect_filled(bar_rect, 0.0, bar);
 
@@ -601,10 +809,8 @@ impl EscPosViewer {
                     self.tcp_last_error = None;
                 }
                 Err(e) => {
-                    self.tcp_last_error = Some(format!(
-                        "No se pudo escuchar 127.0.0.1:9100 ({})",
-                        e
-                    ));
+                    self.tcp_last_error =
+                        Some(format!("No se pudo escuchar 127.0.0.1:9100 ({})", e));
                     self.tcp_capture = None;
                 }
             }
@@ -747,6 +953,7 @@ impl EscPosViewer {
         paper_width: PaperWidth,
         state: &PrinterState,
         text: &str,
+        use_thermal_font: bool,
     ) {
         let cols = Self::effective_columns(paper_width, state);
         let lines = Self::split_and_wrap(text, cols);
@@ -767,9 +974,16 @@ impl EscPosViewer {
             display.push_str(&Self::nbsp_pad(pad));
             display.push_str(&line);
 
+            // Usar fuente DotMatrix si está habilitada, sino Monospace del sistema
+            let font_family = if use_thermal_font {
+                egui::FontFamily::Name("DotMatrix".into())
+            } else {
+                egui::FontFamily::Monospace
+            };
+
             let mut rich_text = egui::RichText::new(display)
                 .color(egui::Color32::BLACK)
-                .family(egui::FontFamily::Monospace)
+                .family(font_family)
                 .size(14.0 * state.char_height_mul.max(1) as f32);
 
             if state.is_bold {
@@ -877,11 +1091,8 @@ impl EscPosViewer {
         let tex = cache
             .entry(key)
             .or_insert_with(|| {
-                ui.ctx().load_texture(
-                    format!("tex_{key}"),
-                    image,
-                    egui::TextureOptions::NEAREST,
-                )
+                ui.ctx()
+                    .load_texture(format!("tex_{key}"), image, egui::TextureOptions::NEAREST)
             })
             .clone();
 
@@ -903,8 +1114,8 @@ impl EscPosViewer {
             return None;
         }
 
-        let total_modules: usize = runs.iter().map(|&r| r as usize).sum::<usize>()
-            + quiet_zone_modules.saturating_mul(2);
+        let total_modules: usize =
+            runs.iter().map(|&r| r as usize).sum::<usize>() + quiet_zone_modules.saturating_mul(2);
         if total_modules == 0 {
             return None;
         }
@@ -1020,22 +1231,20 @@ impl EscPosViewer {
 
         // Tabla Code128 (widths alternando bar/space). Stop (106) tiene 7 dígitos.
         const PATTERNS: [&str; 107] = [
-            "212222", "222122", "222221", "121223", "121322", "131222", "122213",
-            "122312", "132212", "221213", "221312", "231212", "112232", "122132",
-            "122231", "113222", "123122", "123221", "223211", "221132", "221231",
-            "213212", "223112", "312131", "311222", "321122", "321221", "312212",
-            "322112", "322211", "212123", "212321", "232121", "111323", "131123",
-            "131321", "112313", "132113", "132311", "211313", "231113", "231311",
-            "112133", "112331", "132131", "113123", "113321", "133121", "313121",
-            "211331", "231131", "213113", "213311", "213131", "311123", "311321",
-            "331121", "312113", "312311", "332111", "314111", "221411", "431111",
-            "111224", "111422", "121124", "121421", "141122", "141221", "112214",
-            "112412", "122114", "122411", "142112", "142211", "241211", "221114",
-            "413111", "241112", "134111", "111242", "121142", "121241", "114212",
-            "124112", "124211", "411212", "421112", "421211", "212141", "214121",
-            "412121", "111143", "111341", "131141", "114113", "114311", "411113",
-            "411311", "113141", "114131", "311141", "411131", "211412", "211214",
-            "211232", "2331112",
+            "212222", "222122", "222221", "121223", "121322", "131222", "122213", "122312",
+            "132212", "221213", "221312", "231212", "112232", "122132", "122231", "113222",
+            "123122", "123221", "223211", "221132", "221231", "213212", "223112", "312131",
+            "311222", "321122", "321221", "312212", "322112", "322211", "212123", "212321",
+            "232121", "111323", "131123", "131321", "112313", "132113", "132311", "211313",
+            "231113", "231311", "112133", "112331", "132131", "113123", "113321", "133121",
+            "313121", "211331", "231131", "213113", "213311", "213131", "311123", "311321",
+            "331121", "312113", "312311", "332111", "314111", "221411", "431111", "111224",
+            "111422", "121124", "121421", "141122", "141221", "112214", "112412", "122114",
+            "122411", "142112", "142211", "241211", "221114", "413111", "241112", "134111",
+            "111242", "121142", "121241", "114212", "124112", "124211", "411212", "421112",
+            "421211", "212141", "214121", "412121", "111143", "111341", "131141", "114113",
+            "114311", "411113", "411311", "113141", "114131", "311141", "411131", "211412",
+            "211214", "211232", "2331112",
         ];
 
         let s = String::from_utf8_lossy(data);
@@ -1207,20 +1416,20 @@ impl EscPosViewer {
 
         if s.len() == 13 {
             const L: [&str; 10] = [
-                "0001101", "0011001", "0010011", "0111101", "0100011",
-                "0110001", "0101111", "0111011", "0110111", "0001011",
+                "0001101", "0011001", "0010011", "0111101", "0100011", "0110001", "0101111",
+                "0111011", "0110111", "0001011",
             ];
             const G: [&str; 10] = [
-                "0100111", "0110011", "0011011", "0100001", "0011101",
-                "0111001", "0000101", "0010001", "0001001", "0010111",
+                "0100111", "0110011", "0011011", "0100001", "0011101", "0111001", "0000101",
+                "0010001", "0001001", "0010111",
             ];
             const R: [&str; 10] = [
-                "1110010", "1100110", "1101100", "1000010", "1011100",
-                "1001110", "1010000", "1000100", "1001000", "1110100",
+                "1110010", "1100110", "1101100", "1000010", "1011100", "1001110", "1010000",
+                "1000100", "1001000", "1110100",
             ];
             const PAR: [&str; 10] = [
-                "LLLLLL", "LLGLGG", "LLGGLG", "LLGGGL", "LGLLGG",
-                "LGGLLG", "LGGGLL", "LGLGLG", "LGLGGL", "LGGLGL",
+                "LLLLLL", "LLGLGG", "LLGGLG", "LLGGGL", "LGLLGG", "LGGLLG", "LGGGLL", "LGLGLG",
+                "LGLGGL", "LGGLGL",
             ];
 
             let first = s.chars().next()?.to_digit(10)? as usize;
@@ -1265,12 +1474,12 @@ impl EscPosViewer {
 
         if s.len() == 8 {
             const L: [&str; 10] = [
-                "0001101", "0011001", "0010011", "0111101", "0100011",
-                "0110001", "0101111", "0111011", "0110111", "0001011",
+                "0001101", "0011001", "0010011", "0111101", "0100011", "0110001", "0101111",
+                "0111011", "0110111", "0001011",
             ];
             const R: [&str; 10] = [
-                "1110010", "1100110", "1101100", "1000010", "1011100",
-                "1001110", "1010000", "1000100", "1001000", "1110100",
+                "1110010", "1100110", "1101100", "1000010", "1011100", "1001110", "1010000",
+                "1000100", "1001000", "1110100",
             ];
 
             let left = &s[0..4];
@@ -1512,35 +1721,35 @@ impl eframe::App for EscPosViewer {
         if self.ui_mode == UiMode::Full {
             egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                if ui.button("📂 Abrir").clicked() {
-                    if let Some(path) = FileDialog::new()
-                        .add_filter("Printer Files", &["prn", "bin", "txt"])
-                        .pick_file()
-                    {
-                        self.try_load_path(&path);
+                    if ui.button("📂 Abrir").clicked() {
+                        if let Some(path) = FileDialog::new()
+                            .add_filter("Printer Files", &["prn", "bin", "txt"])
+                            .pick_file()
+                        {
+                            self.try_load_path(&path);
+                        }
                     }
-                }
 
-                ui.separator();
-                egui::ComboBox::from_label("Modo")
-                    .selected_text(match self.ui_mode {
-                        UiMode::Preview => "Preview",
-                        UiMode::Full => "Completo",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.ui_mode, UiMode::Preview, "Preview");
-                        ui.selectable_value(&mut self.ui_mode, UiMode::Full, "Completo");
-                    });
-
-                ui.separator();
-                if ui.button("⚙ Configuración").clicked() {
-                    self.show_settings = true;
-                }
-
-                if let Some(job) = self.active_job() {
                     ui.separator();
-                    ui.label(egui::RichText::new(format!("📄 {}", job.label)).weak());
-                }
+                    egui::ComboBox::from_label("Modo")
+                        .selected_text(match self.ui_mode {
+                            UiMode::Preview => "Preview",
+                            UiMode::Full => "Completo",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.ui_mode, UiMode::Preview, "Preview");
+                            ui.selectable_value(&mut self.ui_mode, UiMode::Full, "Completo");
+                        });
+
+                    ui.separator();
+                    if ui.button("⚙ Configuración").clicked() {
+                        self.show_settings = true;
+                    }
+
+                    if let Some(job) = self.active_job() {
+                        ui.separator();
+                        ui.label(egui::RichText::new(format!("📄 {}", job.label)).weak());
+                    }
                 });
 
                 // Barra de jobs (historial / pestañas)
@@ -1588,8 +1797,7 @@ impl eframe::App for EscPosViewer {
                                     {
                                         let line = match cmd {
                                             CommandType::Text(text) => {
-                                                let mut snippet =
-                                                    text.replace(['\r', '\n'], " ");
+                                                let mut snippet = text.replace(['\r', '\n'], " ");
                                                 const MAX: usize = 60;
                                                 if snippet.len() > MAX {
                                                     snippet.truncate(MAX);
@@ -1607,12 +1815,9 @@ impl eframe::App for EscPosViewer {
                                         };
 
                                         ui.label(
-                                            egui::RichText::new(format!(
-                                                "{:04}: {}",
-                                                idx, line
-                                            ))
-                                            .monospace()
-                                            .size(10.0),
+                                            egui::RichText::new(format!("{:04}: {}", idx, line))
+                                                .monospace()
+                                                .size(10.0),
                                         );
                                     }
                                 });
@@ -1657,12 +1862,27 @@ impl eframe::App for EscPosViewer {
                     let paper_width: f32 = desired.min((available - 20.0).max(180.0));
 
                     ui.vertical_centered(|ui| {
+                        // Determinar color y sombra basados en efectos realistas
+                        let (paper_fill, shadow, stroke_color) = if self.realistic_effects {
+                            (
+                                Self::THERMAL_PAPER_COLOR,
+                                Self::get_curved_shadow(),
+                                egui::Color32::from_gray(210),
+                            )
+                        } else {
+                            (
+                                egui::Color32::WHITE,
+                                egui::Shadow::default(),
+                                egui::Color32::from_gray(200),
+                            )
+                        };
+                        
                         let ticket = egui::Frame::none()
-                            .fill(egui::Color32::WHITE)
-                            .shadow(egui::Shadow::default())
-                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(200)))
+                            .fill(paper_fill)
+                            .shadow(shadow)
+                            .stroke(egui::Stroke::new(1.0, stroke_color))
                             .inner_margin(15.0)
-                            .rounding(2.0)
+                            .rounding(0.0) // Sin redondeo para parecer papel real
                             .show(ui, |ui| {
                                 ui.set_min_width(paper_width);
                                 ui.set_max_width(paper_width);
@@ -1681,6 +1901,7 @@ impl eframe::App for EscPosViewer {
                                 };
 
                                 let mut pending: Option<(PrinterState, String)> = None;
+                                let use_thermal_font = self.use_thermal_font;
                                 let flush_pending = |ui: &mut egui::Ui,
                                                      pending: &mut Option<(PrinterState, String)>| {
                                     if let Some((s, t)) = pending.take() {
@@ -1690,6 +1911,7 @@ impl eframe::App for EscPosViewer {
                                                 self.paper_width,
                                                 &s,
                                                 &t,
+                                                use_thermal_font,
                                             );
                                         }
                                     }
@@ -1922,6 +2144,29 @@ impl eframe::App for EscPosViewer {
                             }
                         }
 
+                        // ===== REALISTIC EFFECTS =====
+                        if self.realistic_effects {
+                            let painter = ui.painter();
+                            let rect = ticket.response.rect;
+                            
+                            // 1. Borde superior dentado (efecto papel arrancado)
+                            Self::draw_torn_paper_edge(painter, rect, Self::THERMAL_PAPER_COLOR);
+                            
+                            // 2. Línea de corte inferior (guillotina con tijeras)
+                            Self::draw_cut_line(painter, rect);
+                            
+                            // 3. Textura de papel (grano sutil)
+                            Self::draw_paper_texture(painter, rect);
+                            
+                            // 4. Imperfecciones sutiles (manchas muy leves)
+                            Self::draw_print_imperfections(painter, rect);
+                            
+                            // 5. Indicador de fin de rollo (línea rosa si ticket largo)
+                            let ticket_height = rect.height();
+                            Self::draw_end_of_roll_indicator(painter, rect, ticket_height);
+                        }
+                        // ===== END REALISTIC EFFECTS =====
+
                         if self.ui_mode == UiMode::Preview {
                             ticket.response.context_menu(|ui| {
                                 ui.label("Modo");
@@ -1938,6 +2183,6 @@ impl eframe::App for EscPosViewer {
         // Modal de configuración (se muestra sobre Preview o Completo).
         self.ui_settings_modal(ctx);
 
-            self.last_ui_mode = self.ui_mode;
+        self.last_ui_mode = self.ui_mode;
     }
 }

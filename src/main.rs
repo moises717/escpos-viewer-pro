@@ -1,4 +1,7 @@
-#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 
 mod app;
 mod app_icon;
@@ -9,6 +12,8 @@ mod printer_setup;
 mod tcp_capture;
 mod tray;
 mod window_control;
+
+use eframe::egui;
 
 #[cfg(target_os = "windows")]
 fn try_focus_existing_instance_window() {
@@ -36,8 +41,24 @@ fn try_focus_existing_instance_window() {
             let _ = ShowWindow(hwnd, SW_RESTORE);
 
             // TOPMOST -> NOTOPMOST para forzar foco.
-            let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-            let _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
 
             let _ = BringWindowToTop(hwnd);
             let _ = SetForegroundWindow(hwnd);
@@ -96,6 +117,25 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Visor ESC/POS",
         options,
-        Box::new(|_cc| Ok(Box::new(app::EscPosViewer::default()))),
+        Box::new(|cc| {
+            // Registrar fuente de impresora térmica (DotFont - estilo dot matrix)
+            let mut fonts = egui::FontDefinitions::default();
+
+            // Cargar fuente DotFont personalizada
+            fonts.font_data.insert(
+                "dotfont".to_owned(),
+                egui::FontData::from_static(include_bytes!("../assets/fonts/dotfont.ttf")),
+            );
+
+            // Registrar como familia "DotMatrix"
+            fonts.families.insert(
+                egui::FontFamily::Name("DotMatrix".into()),
+                vec!["dotfont".to_owned()],
+            );
+
+            cc.egui_ctx.set_fonts(fonts);
+
+            Ok(Box::new(app::EscPosViewer::default()))
+        }),
     )
 }
