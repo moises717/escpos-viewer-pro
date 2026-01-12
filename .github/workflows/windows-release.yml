@@ -5,17 +5,25 @@ on:
   push:
     tags:
       - "v*"
+  workflow_run:
+    workflows: ["Release-plz"]
+    types:
+      - completed
 
 permissions:
   contents: write
 
 jobs:
   build-and-release:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: windows-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.ref }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -37,7 +45,17 @@ jobs:
         id: vars
         shell: pwsh
         run: |
-          $v = "${{ github.ref_name }}"
+          if ("${{ github.event_name }}" -eq "workflow_run") {
+            $tag = (git tag --points-at HEAD --list "v*" | Select-Object -First 1)
+            if (-not $tag) {
+              Write-Host "No v* tag on this commit; skipping windows release."
+              exit 0
+            }
+            $v = $tag
+          } else {
+            $v = "${{ github.ref_name }}"
+          }
+
           if ($v.StartsWith('v')) { $v = $v.Substring(1) }
           if ([string]::IsNullOrWhiteSpace($v)) { throw "Version empty" }
           "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
