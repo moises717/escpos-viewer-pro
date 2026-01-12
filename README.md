@@ -8,13 +8,14 @@ Visor de tickets ESC/POS para Windows (Rust + eframe/egui). Captura trabajos de 
 
 ## Características
 
-- **Captura por TCP 9100** (127.0.0.1:9100) para funcionar como “impresora virtual”.
+- **Captura por TCP 9100** (127.0.0.1:9100) para recibir trabajos ESC/POS (RAW).
 - **Modo Preview** (enfocado en el ticket) y **Modo Completo** (controles + debug).
 - **Historial de trabajos** con pestañas por job.
 - **Simulación de impresión** (revelado progresivo) y auto-scroll durante impresión.
 - **System Tray** (bandeja): ocultar/restaurar y auto-abrir al recibir un job.
 - **Instancia única** (evita conflicto del puerto 9100).
 - **Icono embebido** en exe/ventana/tray.
+- **Instalador para Windows** (Inno Setup) que intenta **crear una impresora virtual** apuntando a `127.0.0.1:9100`.
 - **Parser ESC/POS** con soporte para:
   - Texto, saltos de línea, negrita, alineación
   - Tamaño de texto (`GS ! n`)
@@ -31,7 +32,36 @@ Visor de tickets ESC/POS para Windows (Rust + eframe/egui). Captura trabajos de 
 - Windows 10/11
 - Rust (stable) instalado: https://www.rust-lang.org/tools/install
 
+Notas (impresora virtual)
+
+- Para crear puertos/impresoras se requieren **permisos de Administrador**.
+- La creación automática usa PowerShell con cmdlets de **PrintManagement** (`Get-Printer`, `Add-PrinterPort`, `Add-Printer`).
+
 ---
+
+## Instalación (Windows)
+
+Hay dos formas típicas:
+
+1) **Usar el instalador** (recomendado)
+
+- Ejecuta el instalador en [installer/InstaladorVisorESCPOS.exe](installer/InstaladorVisorESCPOS.exe).
+- El instalador se ejecuta como **Administrador** y, al finalizar, intenta crear la impresora:
+  - Impresora: `ESCPos Viewer (TCP 9100)`
+  - Puerto: `ESCPosViewer9100` (RAW a `127.0.0.1:9100`, SNMP deshabilitado)
+  - Driver: `Generic / Text Only`
+- Si falla, el instalador ofrece abrir la guía: [docs/CONFIGURAR_IMPRESORA_TCP_9100.txt](docs/CONFIGURAR_IMPRESORA_TCP_9100.txt)
+
+2) **Compilar desde fuente**
+
+```bash
+cargo build --release
+```
+
+El ejecutable queda en `target\\release\\escpos_viewer.exe`.
+
+Si quieres generar el instalador, este repo incluye un script de Inno Setup: [setup.iss](setup.iss)
+
 
 ## Ejecutar en desarrollo
 
@@ -95,14 +125,36 @@ Abre `⚙ Configuración` para:
 
 ## Instalación como impresora virtual (Windows)
 
-El ejecutable soporta comandos para instalar/desinstalar una impresora virtual (requiere permisos de Administrador):
+El objetivo de la **impresora virtual** es poder imprimir desde cualquier software de Windows hacia una impresora llamada `ESCPos Viewer (TCP 9100)`, y que el visor capture los bytes (RAW) por TCP en `127.0.0.1:9100`.
+
+Formas de crearla:
+
+### A) Automática (instalador)
+
+El instalador de Windows intenta crearla automáticamente al finalizar la instalación.
+
+Si no se pudo, sigue la guía manual: [docs/CONFIGURAR_IMPRESORA_TCP_9100.txt](docs/CONFIGURAR_IMPRESORA_TCP_9100.txt)
+
+### B) Por comando (CLI)
+
+El ejecutable soporta comandos para instalar/desinstalar la impresora (requiere **Administrador**):
 
 ```bash
 escpos_viewer.exe --install-printer
 escpos_viewer.exe --uninstall-printer
 ```
 
-> Dependiendo del entorno, este flujo puede requerir drivers/ajustes de Windows.
+Qué hace internamente (Windows):
+
+- Verifica que exista el driver `Generic / Text Only`.
+- Crea (si no existe) el puerto `ESCPosViewer9100` apuntando a `127.0.0.1:9100`.
+- Crea (si no existe) la impresora `ESCPos Viewer (TCP 9100)` usando ese puerto.
+
+Notas importantes:
+
+- Para que funcione, el visor debe estar abierto y con **Escuchar impresora (TCP 9100)** activado.
+- Algunos programas Windows no envían ESC/POS “crudo” al driver (dependiendo del flujo/driver). Si ves que el resultado no coincide con lo esperado, lo más fiable es que tu POS envíe ESC/POS directamente a `127.0.0.1:9100`.
+- Si PowerShell indica que faltan cmdlets (`Get-Printer`, etc.), configura la impresora manualmente con la guía incluida.
 
 ---
 
