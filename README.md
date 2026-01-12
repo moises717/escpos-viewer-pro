@@ -82,7 +82,7 @@ Abre `⚙ Configuración` para:
 - Historial (auto-scroll, límites, autolimpieza)
 - Debug (Hex/Log, debug de comandos)
 
-**Imagen aquí**
+![Preview](assets/img4.png)
 
 ---
 
