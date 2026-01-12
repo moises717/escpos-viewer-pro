@@ -2,7 +2,7 @@
 
 Visor de tickets ESC/POS para Windows (Rust + eframe/egui). Captura trabajos de impresión por TCP (puerto 9100), los parsea y los renderiza como un ticket (modo Preview), con historial de trabajos y herramientas de depuración.
 
-**Imagen aquí**
+![Preview](assets/img4.gif)
 
 ---
 
@@ -82,7 +82,7 @@ Abre `⚙ Configuración` para:
 - Historial (auto-scroll, límites, autolimpieza)
 - Debug (Hex/Log, debug de comandos)
 
-![Preview](assets/img4.gif)
+![Preview](assets/img2.png)
 
 ---
 
@@ -121,7 +121,6 @@ escpos_viewer.exe --uninstall-printer
 ## Capturas
 
 ![Preview](assets/img1.png)
-![Preview](assets/img2.png)
 ![Preview](assets/img3.png)
 
 - Vista Preview
