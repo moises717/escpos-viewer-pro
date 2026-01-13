@@ -839,6 +839,7 @@ impl EscPosViewer {
     fn debug_label_for_control(control: &Control) -> String {
         match control {
             Control::Newline => "LF".to_string(),
+            Control::Tab => "HT (TAB)".to_string(),
             Control::Init => "ESC @ (INIT)".to_string(),
             Control::Bold(on) => format!("ESC E (BOLD={})", on),
             Control::Align(align) => format!("ESC a (ALIGN={:?})", align),
@@ -894,6 +895,8 @@ impl EscPosViewer {
 
     fn effective_columns(paper_width: PaperWidth, state: &PrinterState) -> usize {
         let base = Self::base_columns(paper_width);
+        // Solo dividir por width_mul (ancho de caracteres)
+        // El height_mul solo afecta la altura visual, no el ancho de columnas
         let div = state.char_width_mul.max(1) as usize;
         (base / div).max(1)
     }
@@ -981,10 +984,19 @@ impl EscPosViewer {
                 egui::FontFamily::Monospace
             };
 
+            // Tamaño de fuente calculado para que el texto ocupe correctamente el ancho del papel
+            // Para 58mm: 300px - 30px padding = 270px ÷ 32 cols ≈ 8.4px por carácter
+            // La fuente monospace a 14px tiene aproximadamente 8.4px de ancho por carácter
+            let base_size = 14.0_f32;
+            let height_mul = state.char_height_mul.max(1) as f32;
+            let width_mul = state.char_width_mul.max(1) as f32;
+            // Escalar por el multiplicador de altura para texto grande
+            let font_size = base_size * height_mul.max(width_mul);
+            
             let mut rich_text = egui::RichText::new(display)
                 .color(egui::Color32::BLACK)
                 .family(font_family)
-                .size(14.0 * state.char_height_mul.max(1) as f32);
+                .size(font_size);
 
             if state.is_bold {
                 rich_text = rich_text.strong();
@@ -1861,7 +1873,14 @@ impl eframe::App for EscPosViewer {
                     let available: f32 = ui.available_width().max(0.0);
                     let paper_width: f32 = desired.min((available - 20.0).max(180.0));
 
-                    ui.vertical_centered(|ui| {
+                    // Centrar el ticket en la ventana, pero el contenido interno respetará la alineación ESC/POS
+                    ui.horizontal(|ui| {
+                        // Calcular margen para centrar (incluir padding del Frame: 15px * 2 lados + stroke)
+                        let total_ticket_width = paper_width + 30.0 + 2.0; // inner_margin * 2 + stroke
+                        let available = ui.available_width();
+                        let margin = ((available - total_ticket_width) / 2.0).max(0.0);
+                        ui.add_space(margin);
+                        
                         // Determinar color y sombra basados en efectos realistas
                         let (paper_fill, shadow, stroke_color) = if self.realistic_effects {
                             (
@@ -1884,6 +1903,8 @@ impl eframe::App for EscPosViewer {
                             .inner_margin(15.0)
                             .rounding(0.0) // Sin redondeo para parecer papel real
                             .show(ui, |ui| {
+                                // Contenido vertical SIN centrado automático para respetar alineación ESC/POS
+                                ui.vertical(|ui| {
                                 ui.set_min_width(paper_width);
                                 ui.set_max_width(paper_width);
                                 ui.set_min_height(400.0);
@@ -2125,6 +2146,16 @@ impl eframe::App for EscPosViewer {
                                                     }
                                                     ui.add_space(6.0);
                                                 }
+                                                Control::Tab => {
+                                                    // Agregar tabulador al texto pendiente para simular columnas
+                                                    if let Some((_, ref mut text)) = pending {
+                                                        // Tab = saltar a siguiente posición de tabulador (cada 8 caracteres típicamente)
+                                                        let current_len = text.chars().count();
+                                                        let next_tab = ((current_len / 8) + 1) * 8;
+                                                        let spaces = next_tab.saturating_sub(current_len);
+                                                        text.push_str(&" ".repeat(spaces.max(1)));
+                                                    }
+                                                }
                                                 _ => {}
                                             }
                                         }
@@ -2135,6 +2166,7 @@ impl eframe::App for EscPosViewer {
                                 flush_pending(ui, &mut pending);
 
                                 self.texture_cache = texture_cache;
+                                }); // fin ui.vertical
                             });
 
                         if let Some(job) = self.active_job() {

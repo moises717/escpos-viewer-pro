@@ -8,13 +8,18 @@ pub enum CommandType {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Control {
     Newline,
+    Tab, // HT (0x09) - Horizontal Tab
     Init,
     Bold(bool),
     Align(Align),
     /// Cambio de tabla de caracteres (ESC t n) interpretado a CodePage.
     CodePage(CodePage),
     /// Raw size byte as received by GS ! n.
-    Size { raw: u8, width: u8, height: u8 },
+    Size {
+        raw: u8,
+        width: u8,
+        height: u8,
+    },
     Cut,
 
     /// Raster bit image: GS v 0

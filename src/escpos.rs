@@ -47,6 +47,11 @@ pub fn parse_escpos(data: &[u8], codepage: CodePage) -> Vec<ParsedCommand> {
                 commands.push((state.clone(), CommandType::Control(Control::Newline)));
                 i += 1;
             }
+            // HT (Horizontal Tab)
+            0x09 => {
+                commands.push((state.clone(), CommandType::Control(Control::Tab)));
+                i += 1;
+            }
             // CR
             0x0D => {
                 i += 1;
@@ -158,7 +163,9 @@ pub fn parse_escpos(data: &[u8], codepage: CodePage) -> Vec<ParsedCommand> {
                                 };
                                 commands.push((
                                     state.clone(),
-                                    CommandType::Control(Control::BarcodeHriPosition(state.barcode_hri)),
+                                    CommandType::Control(Control::BarcodeHriPosition(
+                                        state.barcode_hri,
+                                    )),
                                 ));
                                 i += 3;
                             } else {
@@ -172,7 +179,9 @@ pub fn parse_escpos(data: &[u8], codepage: CodePage) -> Vec<ParsedCommand> {
                                 state.barcode_height = n.max(1);
                                 commands.push((
                                     state.clone(),
-                                    CommandType::Control(Control::BarcodeHeight(state.barcode_height)),
+                                    CommandType::Control(Control::BarcodeHeight(
+                                        state.barcode_height,
+                                    )),
                                 ));
                                 i += 3;
                             } else {
@@ -186,7 +195,9 @@ pub fn parse_escpos(data: &[u8], codepage: CodePage) -> Vec<ParsedCommand> {
                                 state.barcode_module_width = n.max(1);
                                 commands.push((
                                     state.clone(),
-                                    CommandType::Control(Control::BarcodeModuleWidth(state.barcode_module_width)),
+                                    CommandType::Control(Control::BarcodeModuleWidth(
+                                        state.barcode_module_width,
+                                    )),
                                 ));
                                 i += 3;
                             } else {
@@ -200,7 +211,9 @@ pub fn parse_escpos(data: &[u8], codepage: CodePage) -> Vec<ParsedCommand> {
                                 state.barcode_hri_font = n;
                                 commands.push((
                                     state.clone(),
-                                    CommandType::Control(Control::BarcodeHriFont(state.barcode_hri_font)),
+                                    CommandType::Control(Control::BarcodeHriFont(
+                                        state.barcode_hri_font,
+                                    )),
                                 ));
                                 i += 3;
                             } else {
@@ -218,8 +231,8 @@ pub fn parse_escpos(data: &[u8], codepage: CodePage) -> Vec<ParsedCommand> {
                                 let width_bytes = x_l | (x_h << 8);
                                 let height = y_l | (y_h << 8);
 
-                                let data_len = (width_bytes as usize)
-                                    .saturating_mul(height as usize);
+                                let data_len =
+                                    (width_bytes as usize).saturating_mul(height as usize);
                                 let start = i + 8;
                                 let end = start.saturating_add(data_len);
                                 if end <= data.len() {
@@ -346,7 +359,10 @@ pub fn parse_escpos(data: &[u8], codepage: CodePage) -> Vec<ParsedCommand> {
                                             let payload = data[start..end].to_vec();
                                             commands.push((
                                                 state.clone(),
-                                                CommandType::Control(Control::Barcode { m, data: payload }),
+                                                CommandType::Control(Control::Barcode {
+                                                    m,
+                                                    data: payload,
+                                                }),
                                             ));
                                             i = end;
                                         } else {
@@ -385,10 +401,7 @@ pub fn parse_escpos(data: &[u8], codepage: CodePage) -> Vec<ParsedCommand> {
                         }
                         0x56 => {
                             // GS V (Cut)
-                            commands.push((
-                                state.clone(),
-                                CommandType::Control(Control::Cut),
-                            ));
+                            commands.push((state.clone(), CommandType::Control(Control::Cut)));
                             // hack: saltar args comunes
                             i += 3;
                         }
@@ -455,8 +468,12 @@ mod tests {
     fn parses_basic_text_and_newline() {
         let data = b"Hola\n";
         let parsed = parse_escpos(data, CodePage::Utf8Lossy);
-        assert!(parsed.iter().any(|(_, c)| matches!(c, CommandType::Text(t) if t.contains("Hola"))));
-        assert!(parsed.iter().any(|(_, c)| matches!(c, CommandType::Control(Control::Newline))));
+        assert!(parsed
+            .iter()
+            .any(|(_, c)| matches!(c, CommandType::Text(t) if t.contains("Hola"))));
+        assert!(parsed
+            .iter()
+            .any(|(_, c)| matches!(c, CommandType::Control(Control::Newline))));
     }
 
     #[test]
@@ -536,7 +553,10 @@ mod tests {
         let parsed = parse_escpos(&data, CodePage::Cp437);
         let text = collect_text(&parsed).concat();
         assert!(text.contains("¡Hola"));
-        assert!(parsed.iter().any(|(_, c)| matches!(c, CommandType::Control(Control::CodePage(CodePage::Windows1252)))));
+        assert!(parsed.iter().any(|(_, c)| matches!(
+            c,
+            CommandType::Control(Control::CodePage(CodePage::Windows1252))
+        )));
     }
 
     #[test]
