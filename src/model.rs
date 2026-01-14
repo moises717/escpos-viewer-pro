@@ -51,6 +51,34 @@ pub enum Control {
     BarcodeModuleWidth(u8),
     BarcodeHriFont(u8),
 
+    /// ESC $ nL nH - Posición absoluta de impresión (en puntos/dots)
+    AbsolutePosition {
+        x: u16,
+    },
+    /// ESC \ nL nH - Posición relativa de impresión
+    RelativePosition {
+        offset: i16,
+    },
+
+    /// ESC - n - Subrayado (0=off, 1=1dot, 2=2dot)
+    Underline(bool),
+    /// GS B n - Impresión invertida (blanco sobre negro)
+    Reverse(bool),
+    /// ESC ! n - Master select (combinación de bold, underline, size)
+    MasterSelect(u8),
+
+    /// ESC 2 - Interlineado por defecto
+    LineSpacingDefault,
+    /// ESC 3 n - Interlineado en puntos
+    LineSpacing(u8),
+
+    /// ESC * m nL nH d... - Bit image mode (8/24 pines legacy)
+    BitImage {
+        mode: u8,
+        width: u16,
+        data: Vec<u8>,
+    },
+
     EscUnknown(u8),
     GsUnknown(u8),
 }
@@ -66,10 +94,17 @@ pub enum BarcodeHriPosition {
 #[derive(Clone, Debug)]
 pub struct PrinterState {
     pub is_bold: bool,
+    pub is_underline: bool,
+    pub is_reverse: bool,
     pub alignment: Align,
     pub font_scale: f32,
     pub char_width_mul: u8,
     pub char_height_mul: u8,
+
+    /// Posición horizontal del cursor en puntos (dots). None = inicio de línea.
+    pub cursor_x: Option<u16>,
+    /// Interlineado en puntos. None = default (~30 dots).
+    pub line_spacing: Option<u8>,
 
     pub barcode_hri: BarcodeHriPosition,
     pub barcode_height: u8,
@@ -81,10 +116,15 @@ impl Default for PrinterState {
     fn default() -> Self {
         Self {
             is_bold: false,
+            is_underline: false,
+            is_reverse: false,
             alignment: Align::Left,
             font_scale: 1.0,
             char_width_mul: 1,
             char_height_mul: 1,
+
+            cursor_x: None,
+            line_spacing: None,
 
             barcode_hri: BarcodeHriPosition::None,
             // Valores típicos (pueden variar por impresora, pero sirven para preview).
@@ -111,7 +151,12 @@ pub enum PaperWidth {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CodePage {
     Utf8Lossy,
-    Cp437,
-    Cp850,
-    Windows1252,
+    Cp437,       // n=0: USA, Standard Europe
+    Cp850,       // n=2: Multilingual (Latin-1)
+    Windows1252, // n=16: Windows Western European
+    Pc858,       // n=19: CP850 + Euro symbol (€)
+    Iso88591,    // n=6: ISO-8859-1 Latin-1
+    Cp866,       // n=17: Cyrillic (Russian)
+    Cp860,       // n=3: Portuguese
+    Cp865,       // n=4: Nordic
 }

@@ -21,6 +21,27 @@ fn decode_text(bytes: &[u8], codepage: CodePage) -> String {
             let (text, _, _) = encoding_rs::WINDOWS_1252.decode(bytes);
             text.into_owned()
         }
+        CodePage::Pc858 => {
+            // PC858 is CP850 with Euro symbol at 0xD5
+            // For simplicity, use CP850 as base (Euro symbol mapping is close)
+            String::from_cp::<Cp850>(bytes)
+        }
+        CodePage::Iso88591 => {
+            let (text, _, _) = encoding_rs::ISO_8859_2.decode(bytes);
+            text.into_owned()
+        }
+        CodePage::Cp866 => {
+            let (text, _, _) = encoding_rs::IBM866.decode(bytes);
+            text.into_owned()
+        }
+        CodePage::Cp860 => {
+            // Portuguese - fallback to CP850 (similar)
+            String::from_cp::<Cp850>(bytes)
+        }
+        CodePage::Cp865 => {
+            // Nordic - fallback to CP850 (similar)
+            String::from_cp::<Cp850>(bytes)
+        }
     }
 }
 
@@ -45,6 +66,8 @@ pub fn parse_escpos(data: &[u8], codepage: CodePage) -> Vec<ParsedCommand> {
             // LF
             0x0A => {
                 commands.push((state.clone(), CommandType::Control(Control::Newline)));
+                // Reset cursor position on newline (ESC/POS standard behavior)
+                state.cursor_x = None;
                 i += 1;
             }
             // HT (Horizontal Tab)
@@ -107,13 +130,18 @@ pub fn parse_escpos(data: &[u8], codepage: CodePage) -> Vec<ParsedCommand> {
                         }
                         0x74 => {
                             // ESC t n (selección de code table / codepage)
-                            // Mapeo común (Epson): 0=CP437, 2=CP850, 16=Windows-1252.
+                            // Mapeo común (Epson): 0=CP437, 2=CP850, 16=Windows-1252, etc.
                             if i + 2 < data.len() {
                                 let n = data[i + 2];
                                 if let Some(mapped) = match n {
                                     0 => Some(CodePage::Cp437),
                                     2 => Some(CodePage::Cp850),
+                                    3 => Some(CodePage::Cp860), // Portuguese
+                                    4 => Some(CodePage::Cp865), // Nordic
+                                    6 => Some(CodePage::Iso88591), // ISO-8859-1
                                     16 => Some(CodePage::Windows1252),
+                                    17 => Some(CodePage::Cp866), // Cyrillic
+                                    19 => Some(CodePage::Pc858), // CP850 + Euro
                                     _ => None,
                                 } {
                                     active_codepage = mapped;
@@ -129,6 +157,129 @@ pub fn parse_escpos(data: &[u8], codepage: CodePage) -> Vec<ParsedCommand> {
                                     ));
                                 }
                                 i += 3;
+                            } else {
+                                i += 2;
+                            }
+                        }
+                        0x24 => {
+                            // ESC $ nL nH (Absolute print position)
+                            if i + 3 < data.len() {
+                                let n_l = data[i + 2] as u16;
+                                let n_h = data[i + 3] as u16;
+                                let pos = n_l | (n_h << 8);
+                                state.cursor_x = Some(pos);
+                                commands.push((
+                                    state.clone(),
+                                    CommandType::Control(Control::AbsolutePosition { x: pos }),
+                                ));
+                                i += 4;
+                            } else {
+                                i += 2;
+                            }
+                        }
+                        0x5C => {
+                            // ESC \ nL nH (Relative print position)
+                            if i + 3 < data.len() {
+                                let n_l = data[i + 2] as u16;
+                                let n_h = data[i + 3] as u16;
+                                let offset = (n_l | (n_h << 8)) as i16;
+                                commands.push((
+                                    state.clone(),
+                                    CommandType::Control(Control::RelativePosition { offset }),
+                                ));
+                                i += 4;
+                            } else {
+                                i += 2;
+                            }
+                        }
+                        0x2D => {
+                            // ESC - n (Underline)
+                            if i + 2 < data.len() {
+                                let n = data[i + 2];
+                                state.is_underline = n == 1 || n == 2;
+                                commands.push((
+                                    state.clone(),
+                                    CommandType::Control(Control::Underline(state.is_underline)),
+                                ));
+                                i += 3;
+                            } else {
+                                i += 2;
+                            }
+                        }
+                        0x21 => {
+                            // ESC ! n (Master select)
+                            // Bit 3: Bold, Bit 4: Double height, Bit 5: Double width, Bit 7: Underline
+                            if i + 2 < data.len() {
+                                let n = data[i + 2];
+                                state.is_bold = (n & 0x08) != 0;
+                                state.is_underline = (n & 0x80) != 0;
+                                let dh = if (n & 0x10) != 0 { 1 } else { 0 };
+                                let dw = if (n & 0x20) != 0 { 1 } else { 0 };
+                                state.char_height_mul = dh + 1;
+                                state.char_width_mul = dw + 1;
+                                state.font_scale = state.char_height_mul as f32;
+                                commands.push((
+                                    state.clone(),
+                                    CommandType::Control(Control::MasterSelect(n)),
+                                ));
+                                i += 3;
+                            } else {
+                                i += 2;
+                            }
+                        }
+                        0x32 => {
+                            // ESC 2 (Default line spacing)
+                            state.line_spacing = None;
+                            commands.push((
+                                state.clone(),
+                                CommandType::Control(Control::LineSpacingDefault),
+                            ));
+                            i += 2;
+                        }
+                        0x33 => {
+                            // ESC 3 n (Set line spacing)
+                            if i + 2 < data.len() {
+                                let n = data[i + 2];
+                                state.line_spacing = Some(n);
+                                commands.push((
+                                    state.clone(),
+                                    CommandType::Control(Control::LineSpacing(n)),
+                                ));
+                                i += 3;
+                            } else {
+                                i += 2;
+                            }
+                        }
+                        0x2A => {
+                            // ESC * m nL nH d... (Select bit image mode)
+                            if i + 4 < data.len() {
+                                let m = data[i + 2];
+                                let n_l = data[i + 3] as u16;
+                                let n_h = data[i + 4] as u16;
+                                let width = n_l | (n_h << 8);
+                                // Bytes per column: mode 0,1 = 1 byte (8 pins), mode 32,33 = 3 bytes (24 pins)
+                                let bytes_per_col = match m {
+                                    0 | 1 => 1usize,
+                                    32 | 33 => 3usize,
+                                    _ => 1usize,
+                                };
+                                let data_len = (width as usize).saturating_mul(bytes_per_col);
+                                let start = i + 5;
+                                let end = start.saturating_add(data_len);
+                                if end <= data.len() {
+                                    let img_data = data[start..end].to_vec();
+                                    commands.push((
+                                        state.clone(),
+                                        CommandType::Control(Control::BitImage {
+                                            mode: m,
+                                            width,
+                                            data: img_data,
+                                        }),
+                                    ));
+                                    i = end;
+                                } else {
+                                    i += 2;
+                                }
                             } else {
                                 i += 2;
                             }
@@ -405,6 +556,20 @@ pub fn parse_escpos(data: &[u8], codepage: CodePage) -> Vec<ParsedCommand> {
                             // hack: saltar args comunes
                             i += 3;
                         }
+                        0x42 => {
+                            // GS B n (Reverse printing - white on black)
+                            if i + 2 < data.len() {
+                                let n = data[i + 2];
+                                state.is_reverse = (n & 0x01) != 0;
+                                commands.push((
+                                    state.clone(),
+                                    CommandType::Control(Control::Reverse(state.is_reverse)),
+                                ));
+                                i += 3;
+                            } else {
+                                i += 2;
+                            }
+                        }
                         _ => {
                             commands.push((
                                 state.clone(),
@@ -630,5 +795,77 @@ mod tests {
         let texts = collect_text(&parsed).concat();
         assert!(!texts.contains('2'));
         assert!(texts.contains('A'));
+    }
+
+    #[test]
+    fn esc_dollar_sets_absolute_position() {
+        // ESC $ 100 0 (posición 100 dots)
+        let data = [0x1B, 0x24, 0x64, 0x00, b'A'];
+        let parsed = parse_escpos(&data, CodePage::Utf8Lossy);
+        assert!(parsed.iter().any(|(s, _)| s.cursor_x == Some(100)));
+        assert!(parsed.iter().any(|(_, c)| matches!(
+            c,
+            CommandType::Control(Control::AbsolutePosition { x: 100 })
+        )));
+    }
+
+    #[test]
+    fn esc_minus_enables_underline() {
+        let data = [0x1B, 0x2D, 0x01, b'A'];
+        let parsed = parse_escpos(&data, CodePage::Utf8Lossy);
+        let a_state = parsed
+            .iter()
+            .find(|(_, c)| matches!(c, CommandType::Text(t) if t.contains('A')))
+            .map(|(s, _)| s)
+            .unwrap();
+        assert!(a_state.is_underline);
+    }
+
+    #[test]
+    fn gs_b_enables_reverse() {
+        let data = [0x1D, 0x42, 0x01, b'A'];
+        let parsed = parse_escpos(&data, CodePage::Utf8Lossy);
+        let a_state = parsed
+            .iter()
+            .find(|(_, c)| matches!(c, CommandType::Text(t) if t.contains('A')))
+            .map(|(s, _)| s)
+            .unwrap();
+        assert!(a_state.is_reverse);
+    }
+
+    #[test]
+    fn esc_bang_master_select_bold_and_double_height() {
+        // ESC ! 0x18 = bold (bit 3) + double height (bit 4)
+        let data = [0x1B, 0x21, 0x18, b'A'];
+        let parsed = parse_escpos(&data, CodePage::Utf8Lossy);
+        let a_state = parsed
+            .iter()
+            .find(|(_, c)| matches!(c, CommandType::Text(t) if t.contains('A')))
+            .map(|(s, _)| s)
+            .unwrap();
+        assert!(a_state.is_bold);
+        assert_eq!(a_state.char_height_mul, 2);
+    }
+
+    #[test]
+    fn esc_3_sets_line_spacing() {
+        let data = [0x1B, 0x33, 0x30]; // ESC 3 48
+        let parsed = parse_escpos(&data, CodePage::Utf8Lossy);
+        assert!(parsed.iter().any(|(s, _)| s.line_spacing == Some(48)));
+    }
+
+    #[test]
+    fn esc_star_parses_bit_image() {
+        // ESC * mode=0, width=2, data=[0x80, 0x40]
+        let data = [0x1B, 0x2A, 0x00, 0x02, 0x00, 0x80, 0x40];
+        let parsed = parse_escpos(&data, CodePage::Utf8Lossy);
+        assert!(parsed.iter().any(|(_, c)| matches!(
+            c,
+            CommandType::Control(Control::BitImage {
+                mode: 0,
+                width: 2,
+                ..
+            })
+        )));
     }
 }

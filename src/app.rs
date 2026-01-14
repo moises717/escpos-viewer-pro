@@ -353,10 +353,15 @@ impl EscPosViewer {
                             let before = self.codepage;
                             egui::ComboBox::from_label("Codepage")
                                 .selected_text(match self.codepage {
-                                    CodePage::Utf8Lossy => "UTF-8 (auto: fallback Win-1252)",
+                                    CodePage::Utf8Lossy => "UTF-8 (auto)",
                                     CodePage::Cp437 => "CP437",
                                     CodePage::Cp850 => "CP850",
                                     CodePage::Windows1252 => "Windows-1252",
+                                    CodePage::Pc858 => "PC858 (€)",
+                                    CodePage::Iso88591 => "ISO-8859-1",
+                                    CodePage::Cp866 => "CP866 (Cyrillic)",
+                                    CodePage::Cp860 => "CP860 (Portuguese)",
+                                    CodePage::Cp865 => "CP865 (Nordic)",
                                 })
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(
@@ -367,17 +372,42 @@ impl EscPosViewer {
                                     ui.selectable_value(
                                         &mut self.codepage,
                                         CodePage::Cp437,
-                                        "CP437",
+                                        "CP437 (USA/Europe)",
                                     );
                                     ui.selectable_value(
                                         &mut self.codepage,
                                         CodePage::Cp850,
-                                        "CP850",
+                                        "CP850 (Multilingual)",
                                     );
                                     ui.selectable_value(
                                         &mut self.codepage,
                                         CodePage::Windows1252,
                                         "Windows-1252",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.codepage,
+                                        CodePage::Pc858,
+                                        "PC858 (CP850 + €)",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.codepage,
+                                        CodePage::Iso88591,
+                                        "ISO-8859-1 (Latin-1)",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.codepage,
+                                        CodePage::Cp866,
+                                        "CP866 (Cyrillic/Russian)",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.codepage,
+                                        CodePage::Cp860,
+                                        "CP860 (Portuguese)",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.codepage,
+                                        CodePage::Cp865,
+                                        "CP865 (Nordic)",
                                     );
                                 });
                             if self.codepage != before {
@@ -881,6 +911,16 @@ impl EscPosViewer {
             Control::BarcodeHeight(n) => format!("GS h (BARCODE HEIGHT={})", n),
             Control::BarcodeModuleWidth(n) => format!("GS w (BARCODE WIDTH={})", n),
             Control::BarcodeHriFont(n) => format!("GS f (HRI FONT={})", n),
+            Control::AbsolutePosition { x } => format!("ESC $ (POS={})", x),
+            Control::RelativePosition { offset } => format!("ESC \\ (OFFSET={})", offset),
+            Control::Underline(on) => format!("ESC - (UNDERLINE={})", on),
+            Control::Reverse(on) => format!("GS B (REVERSE={})", on),
+            Control::MasterSelect(n) => format!("ESC ! (MASTER={:02X})", n),
+            Control::LineSpacingDefault => "ESC 2 (LINE SPACING DEFAULT)".to_string(),
+            Control::LineSpacing(n) => format!("ESC 3 (LINE SPACING={})", n),
+            Control::BitImage { mode, width, data } => {
+                format!("ESC * (BIT IMAGE mode={} w={} bytes={})", mode, width, data.len())
+            }
             Control::EscUnknown(b) => format!("ESC {:02X} (?)", b),
             Control::GsUnknown(b) => format!("GS {:02X} (?)", b),
         }
@@ -903,6 +943,8 @@ impl EscPosViewer {
 
     fn same_line_style(a: &PrinterState, b: &PrinterState) -> bool {
         a.is_bold == b.is_bold
+            && a.is_underline == b.is_underline
+            && a.is_reverse == b.is_reverse
             && a.alignment == b.alignment
             && a.char_width_mul == b.char_width_mul
             && a.char_height_mul == b.char_height_mul
@@ -963,6 +1005,9 @@ impl EscPosViewer {
 
         for line in lines {
             let len = line.chars().count();
+            
+            // Calculate padding based on alignment only
+            // (cursor_x is handled by inserting spaces in the text buffer directly)
             let pad = if len >= cols {
                 0
             } else {
@@ -1000,6 +1045,17 @@ impl EscPosViewer {
 
             if state.is_bold {
                 rich_text = rich_text.strong();
+            }
+
+            if state.is_underline {
+                rich_text = rich_text.underline();
+            }
+
+            if state.is_reverse {
+                // Invertir colores: texto blanco sobre fondo negro
+                rich_text = rich_text
+                    .background_color(egui::Color32::BLACK)
+                    .color(egui::Color32::WHITE);
             }
 
             ui.add(egui::Label::new(rich_text));
@@ -1041,6 +1097,53 @@ impl EscPosViewer {
 
         Some(egui::ColorImage {
             size: [width_bits, height],
+            pixels,
+        })
+    }
+
+    /// Convert ESC * bit image (8/24-pin legacy format) to egui ColorImage.
+    /// mode 0,1 = 8-dot vertical (1 byte per column)
+    /// mode 32,33 = 24-dot vertical (3 bytes per column)
+    fn bitimage_to_image(mode: u8, width: u16, data: &[u8]) -> Option<egui::ColorImage> {
+        let width = width as usize;
+        if width == 0 {
+            return None;
+        }
+
+        // 8-pin modes: 1 byte per column = 8 vertical dots
+        // 24-pin modes: 3 bytes per column = 24 vertical dots
+        let (bytes_per_col, height) = match mode {
+            0 | 1 => (1usize, 8usize),
+            32 | 33 => (3usize, 24usize),
+            _ => (1usize, 8usize),
+        };
+
+        let expected = width.saturating_mul(bytes_per_col);
+        if data.len() < expected {
+            return None;
+        }
+
+        let mut pixels = vec![egui::Color32::WHITE; width * height];
+
+        for col in 0..width {
+            let col_data = &data[col * bytes_per_col..(col + 1) * bytes_per_col];
+            for (byte_idx, &byte) in col_data.iter().enumerate() {
+                for bit in 0..8 {
+                    let y = byte_idx * 8 + bit;
+                    if y >= height {
+                        break;
+                    }
+                    let is_black = (byte & (1 << (7 - bit))) != 0;
+                    let idx = y * width + col;
+                    if is_black {
+                        pixels[idx] = egui::Color32::BLACK;
+                    }
+                }
+            }
+        }
+
+        Some(egui::ColorImage {
+            size: [width, height],
             pixels,
         })
     }
@@ -1524,6 +1627,74 @@ impl EscPosViewer {
         None
     }
 
+    /// Encode Code39 barcode. Supports digits, uppercase letters, and special chars: - . $ / + % SPACE
+    fn encode_code39_runs(data: &str) -> Option<(Vec<u8>, String)> {
+        // Code39 patterns: 9 elements per character (5 bars, 4 spaces)
+        // 1 = wide, 0 = narrow. Pattern is: BSBSBSBSB (bar-space alternating)
+        const PATTERNS: &[(char, &str)] = &[
+            ('0', "101001101101"), ('1', "110100101011"), ('2', "101100101011"),
+            ('3', "110110010101"), ('4', "101001101011"), ('5', "110100110101"),
+            ('6', "101100110101"), ('7', "101001011011"), ('8', "110100101101"),
+            ('9', "101100101101"), ('A', "110101001011"), ('B', "101101001011"),
+            ('C', "110110100101"), ('D', "101011001011"), ('E', "110101100101"),
+            ('F', "101101100101"), ('G', "101010011011"), ('H', "110101001101"),
+            ('I', "101101001101"), ('J', "101011001101"), ('K', "110101010011"),
+            ('L', "101101010011"), ('M', "110110101001"), ('N', "101011010011"),
+            ('O', "110101101001"), ('P', "101101101001"), ('Q', "101010110011"),
+            ('R', "110101011001"), ('S', "101101011001"), ('T', "101011011001"),
+            ('U', "110010101011"), ('V', "100110101011"), ('W', "110011010101"),
+            ('X', "100101101011"), ('Y', "110010110101"), ('Z', "100110110101"),
+            ('-', "100101011011"), ('.', "110010101101"), (' ', "100110101101"),
+            ('$', "100100100101"), ('/', "100100101001"), ('+', "100101001001"),
+            ('%', "101001001001"), ('*', "100101101101"), // Start/stop character
+        ];
+
+        fn get_pattern(c: char) -> Option<&'static str> {
+            PATTERNS.iter()
+                .find(|(ch, _)| *ch == c.to_ascii_uppercase())
+                .map(|(_, p)| *p)
+        }
+
+        let hri: String = data.chars()
+            .filter(|c| get_pattern(*c).is_some() && *c != '*')
+            .collect();
+        
+        if hri.is_empty() {
+            return None;
+        }
+
+        let mut bits: Vec<u8> = Vec::new();
+        
+        // Start character (*)
+        let start = get_pattern('*')?;
+        for b in start.bytes() {
+            bits.push((b == b'1') as u8);
+        }
+        bits.push(0); // Inter-character gap
+        
+        // Data characters
+        for c in hri.chars() {
+            let pattern = get_pattern(c)?;
+            for b in pattern.bytes() {
+                bits.push((b == b'1') as u8);
+            }
+            bits.push(0); // Inter-character gap
+        }
+        
+        // Stop character (*)
+        let stop = get_pattern('*')?;
+        for b in stop.bytes() {
+            bits.push((b == b'1') as u8);
+        }
+        
+        let (runs, start_black) = Self::bits01_to_runs(&bits)?;
+        if !start_black {
+            return None;
+        }
+        
+        Some((runs, hri))
+    }
+
     fn encode_itf_runs(digits: &str) -> Option<(Vec<u8>, String)> {
         let mut s: String = digits.chars().filter(|c| c.is_ascii_digit()).collect();
         if s.is_empty() {
@@ -1599,6 +1770,12 @@ impl EscPosViewer {
             0x46 => {
                 let digits = String::from_utf8_lossy(data);
                 let (runs, hri) = Self::encode_itf_runs(&digits)?;
+                (runs, true, Some(hri))
+            }
+            0x45 => {
+                // Code39
+                let text = String::from_utf8_lossy(data);
+                let (runs, hri) = Self::encode_code39_runs(&text)?;
                 (runs, true, Some(hri))
             }
             _ => {
@@ -1941,19 +2118,30 @@ impl eframe::App for EscPosViewer {
                                 for (state, cmd) in &job.parsed_commands {
                                     match cmd {
                                         CommandType::Text(text) => match &mut pending {
-                                            Some((ps, buf))
-                                                if Self::same_line_style(ps, state) =>
-                                            {
-                                                buf.push_str(text);
-                                            }
-                                            Some(_) => {
-                                                flush_pending(ui, &mut pending);
-                                                pending =
-                                                    Some((state.clone(), text.clone()));
+                                            Some((ps, buf)) => {
+                                                // If cursor_x changed, add padding spaces
+                                                if state.cursor_x != ps.cursor_x {
+                                                    if let Some(cursor_x) = state.cursor_x {
+                                                        // Convert dots to columns
+                                                        let dots_per_col = 12u16;
+                                                        let target_col = (cursor_x / dots_per_col) as usize;
+                                                        let current_col = buf.chars().count();
+                                                        if target_col > current_col {
+                                                            let spaces = target_col - current_col;
+                                                            buf.push_str(&" ".repeat(spaces));
+                                                        }
+                                                    }
+                                                }
+                                                
+                                                if Self::same_line_style(ps, state) {
+                                                    buf.push_str(text);
+                                                } else {
+                                                    flush_pending(ui, &mut pending);
+                                                    pending = Some((state.clone(), text.clone()));
+                                                }
                                             }
                                             None => {
-                                                pending =
-                                                    Some((state.clone(), text.clone()));
+                                                pending = Some((state.clone(), text.clone()));
                                             }
                                         },
                                         CommandType::Control(control) => {
@@ -2154,6 +2342,29 @@ impl eframe::App for EscPosViewer {
                                                         let next_tab = ((current_len / 8) + 1) * 8;
                                                         let spaces = next_tab.saturating_sub(current_len);
                                                         text.push_str(&" ".repeat(spaces.max(1)));
+                                                    }
+                                                }
+                                                Control::BitImage { mode, width, data } => {
+                                                    flush_pending(ui, &mut pending);
+                                                    if let Some(img) = Self::bitimage_to_image(
+                                                        *mode,
+                                                        *width,
+                                                        data,
+                                                    ) {
+                                                        let key = Self::hash_key(&(
+                                                            "bitimage",
+                                                            mode,
+                                                            width,
+                                                            data,
+                                                        ));
+                                                        Self::show_image_scaled(
+                                                            ui,
+                                                            &mut texture_cache,
+                                                            key,
+                                                            img,
+                                                            paper_width,
+                                                        );
+                                                        ui.add_space(4.0);
                                                     }
                                                 }
                                                 _ => {}
