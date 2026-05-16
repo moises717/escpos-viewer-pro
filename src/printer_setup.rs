@@ -3,49 +3,66 @@ use std::process::Command;
 
 #[cfg(windows)]
 pub fn install_printer() -> Result<(), String> {
-    // Requires admin privileges to create ports/printers.
-    // Uses PrintManagement cmdlets: Add-PrinterPort / Add-Printer.
-    // Key fixes for virtual printer status:
-    // 1. Try "Microsoft Print to PDF" first - never reports fake errors
-    // 2. Disable SNMP and bidirectional support to avoid error flags
+    // Requiere privilegios de administrador para crear puertos/impresoras.
+    // Utiliza los cmdlets de PrintManagement: Add-PrinterPort / Add-Printer.
     let script = r#"
 $ErrorActionPreference = 'Stop'
 $portName = 'ESCPosViewer9100'
 $printerName = 'ESCPos Viewer (TCP 9100)'
 
-# Try multiple drivers in order of preference
-# "Microsoft Print to PDF" - never reports fake errors, works for TCP/IP virtual printers
-# "Generic / Text Only" - fallback but may report Error status incorrectly
-$drivers = @('Microsoft Print to PDF', 'Generic / Text Only')
-$driverName = $null
+try {
+    # 1. Buscar drivers compatibles (soporte para Windows en inglés y español)
+    # Prioridad: Texto Genérico (RAW) -> PDF (fallback) -> Búsqueda por patrón
+    $driversToTry = @(
+        'Generic / Text Only',
+        'Genérico / Solo texto',
+        'Microsoft Print to PDF',
+        'Microsoft imprimir en PDF'
+    )
+    $driverName = $null
 
-foreach ($d in $drivers) {
-    if (Get-PrinterDriver -Name $d -ErrorAction SilentlyContinue) {
-        $driverName = $d
-        break
+    # Intento por nombres exactos conocidos
+    foreach ($d in $driversToTry) {
+        if (Get-PrinterDriver -Name $d -ErrorAction SilentlyContinue) {
+            $driverName = $d
+            break
+        }
     }
-}
 
-if (-not $driverName) {
-    throw "No se encontro ningun driver compatible"
-}
+    # Si no se encuentra por nombre exacto, buscar por patrón (wildcard)
+    if (-not $driverName) {
+        $found = Get-PrinterDriver -Name "*Generic*Text*", "*Genérico*texto*", "*Generic*", "*PDF*" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($found) {
+            $driverName = $found.Name
+        }
+    }
 
-if (-not (Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue)) {
-    # Create TCP/IP port WITHOUT SNMP (SNMP causes error status on virtual printers)
-    Add-PrinterPort -Name $portName -PrinterHostAddress 127.0.0.1 -PortNumber 9100 -SNMPEnabled $false | Out-Null
-}
+    if (-not $driverName) {
+        throw "No se encontró ningún driver compatible (Generic / Text Only o Microsoft Print to PDF)."
+    }
 
-if (-not (Get-Printer -Name $printerName -ErrorAction SilentlyContinue)) {
-    Add-Printer -Name $printerName -DriverName $driverName -PortName $portName | Out-Null
-}
+    # 2. Crear Puerto TCP/IP si no existe
+    if (-not (Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue)) {
+        # Creamos el puerto TCP/IP estándar para loopback
+        # Se omite -SNMP 0 por problemas de compatibilidad en algunas versiones de Windows
+        Add-PrinterPort -Name $portName -PrinterHostAddress 127.0.0.1 -PortNumber 9100 | Out-Null
+    }
 
-# Disable bidirectional support and SNMP for clean status reporting
-$printer = Get-Printer -Name $printerName
-if ($printer) {
-    Set-Printer -Name $printerName -BiDirectional $false -SNMPCommunity $null
-}
+    # 3. Crear Impresora si no existe
+    if (-not (Get-Printer -Name $printerName -ErrorAction SilentlyContinue)) {
+        Add-Printer -Name $printerName -DriverName $driverName -PortName $portName | Out-Null
+    }
 
-Write-Output "OK: $printerName (driver: $driverName)"
+    # 4. Configuración post-instalación
+    # Deshabilitamos la publicación en el directorio para evitar ruidos en red
+    Set-Printer -Name $printerName -Published $false | Out-Null
+
+    Write-Output "OK: $printerName (driver: $driverName)"
+} catch {
+    $msg = $_.Exception.Message
+    Write-Error "Fallo en configuración de impresora: $msg"
+    exit 1
+}
 "#;
 
     let output = Command::new("powershell")
@@ -77,10 +94,14 @@ $ErrorActionPreference = 'SilentlyContinue'
 $portName = 'ESCPosViewer9100'
 $printerName = 'ESCPos Viewer (TCP 9100)'
 
-Get-Printer -Name $printerName | Remove-Printer | Out-Null
-Get-PrinterPort -Name $portName | Remove-PrinterPort | Out-Null
-
-Write-Output "OK: removed (if existed)"
+try {
+    Get-Printer -Name $printerName | Remove-Printer | Out-Null
+    Get-PrinterPort -Name $portName | Remove-PrinterPort | Out-Null
+    Write-Output "OK: removed (if existed)"
+} catch {
+    # Ignoramos fallos en desinstalación (ej. ya no existe) pero reportamos éxito
+    Write-Output "OK: cleanup attempted"
+}
 "#;
 
     let output = Command::new("powershell")
