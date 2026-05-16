@@ -129,34 +129,29 @@ try {
 #[cfg(windows)]
 pub fn set_printer_offline(offline: bool) -> Result<(), String> {
     let status_val = if offline { "$true" } else { "$false" };
+    
+    // Usamos Start-Process con WindowStyle Hidden para evitar CUALQUIER ventana o parpadeo.
+    // El script se pasa como un bloque de comando escapado para PowerShell.
     let script = format!(
-        r#"
-$ErrorActionPreference = 'Stop'
-$printerName = 'ESCPos Viewer (TCP 9100)'
-
-try {{
-    $p = Get-CimInstance Win32_Printer | Where-Object Name -eq $printerName
-    if ($p) {{
-        $p.WorkOffline = {}
-        Set-CimInstance -InputObject $p
-    }}
-}} catch {{
-    exit 1
-}}
-"#,
+        r#"$p = Get-CimInstance Win32_Printer | Where-Object Name -eq 'ESCPos Viewer (TCP 9100)'; if ($p) {{ $p.WorkOffline = {}; Set-CimInstance -InputObject $p }}"#,
         status_val
     );
 
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script])
-        .output()
-        .map_err(|e| format!("No se pudo ejecutar PowerShell: {e}"))?;
+    let ps_command = format!(
+        "Start-Process powershell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', \"{}\" -WindowStyle Hidden",
+        script.replace("\"", "'")
+    );
 
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err("Fallo al cambiar estado de la impresora".to_string())
-    }
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &ps_command])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|e| format!("No se pudo lanzar PowerShell: {e}"))?;
+
+    Ok(())
 }
 
 #[cfg(not(windows))]
