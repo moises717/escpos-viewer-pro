@@ -126,6 +126,39 @@ try {
     }
 }
 
+#[cfg(windows)]
+pub fn set_printer_offline(offline: bool) -> Result<(), String> {
+    let status_val = if offline { "$true" } else { "$false" };
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+$printerName = 'ESCPos Viewer (TCP 9100)'
+
+try {{
+    $p = Get-CimInstance Win32_Printer | Where-Object Name -eq $printerName
+    if ($p) {{
+        $p.WorkOffline = {}
+        Set-CimInstance -InputObject $p
+    }}
+}} catch {{
+    exit 1
+}}
+"#,
+        status_val
+    );
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script])
+        .output()
+        .map_err(|e| format!("No se pudo ejecutar PowerShell: {e}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err("Fallo al cambiar estado de la impresora".to_string())
+    }
+}
+
 #[cfg(not(windows))]
 pub fn install_printer() -> Result<(), String> {
     Err("Instalacion de impresora solo soportada en Windows".to_string())
@@ -134,4 +167,9 @@ pub fn install_printer() -> Result<(), String> {
 #[cfg(not(windows))]
 pub fn uninstall_printer() -> Result<(), String> {
     Err("Desinstalacion de impresora solo soportada en Windows".to_string())
+}
+
+#[cfg(not(windows))]
+pub fn set_printer_offline(_offline: bool) -> Result<(), String> {
+    Ok(())
 }

@@ -837,6 +837,8 @@ impl EscPosViewer {
                 Ok(capture) => {
                     self.tcp_capture = Some(capture);
                     self.tcp_last_error = None;
+                    // Al empezar a escuchar, ponemos la impresora ONLINE
+                    let _ = crate::printer_setup::set_printer_offline(false);
                 }
                 Err(e) => {
                     self.tcp_last_error =
@@ -847,6 +849,8 @@ impl EscPosViewer {
         } else if let Some(mut cap) = self.tcp_capture.take() {
             cap.stop();
             self.tcp_capture = None;
+            // Al dejar de escuchar, ponemos la impresora OFFLINE para retener trabajos
+            let _ = crate::printer_setup::set_printer_offline(true);
         }
     }
 
@@ -1789,6 +1793,14 @@ impl EscPosViewer {
         // Si el barcode queda demasiado pequeño, egui lo escalará con show_image_scaled.
         let _ = target_width;
         Some((img, hri))
+    }
+}
+
+impl Drop for EscPosViewer {
+    fn drop(&mut self) {
+        // Al cerrar la aplicación, forzamos que la impresora quede en OFFLINE.
+        // Esto permite que los trabajos se acumulen en el Spooler de Windows.
+        let _ = crate::printer_setup::set_printer_offline(true);
     }
 }
 
