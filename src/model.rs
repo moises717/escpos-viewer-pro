@@ -79,6 +79,11 @@ pub enum Control {
         data: Vec<u8>,
     },
 
+    /// ESC M n - Seleccionar tipo de fuente (0=Font A, 1=Font B)
+    FontSelect(bool),
+    /// ESC p m t1 t2 - Apertura del cajón portamonedas
+    OpenDrawer,
+
     EscUnknown(u8),
     GsUnknown(u8),
 }
@@ -96,6 +101,7 @@ pub struct PrinterState {
     pub is_bold: bool,
     pub is_underline: bool,
     pub is_reverse: bool,
+    pub is_font_b: bool,
     pub alignment: Align,
     pub font_scale: f32,
     pub char_width_mul: u8,
@@ -118,6 +124,7 @@ impl Default for PrinterState {
             is_bold: false,
             is_underline: false,
             is_reverse: false,
+            is_font_b: false,
             alignment: Align::Left,
             font_scale: 1.0,
             char_width_mul: 1,
