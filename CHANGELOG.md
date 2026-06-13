@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0](https://github.com/moises717/escpos-viewer-pro/releases/tag/v1.7.0) - 2026-06-13
+
+### Added
+
+- *(model)* FontSelect and OpenDrawer controls with is_font_b state tracking
+- *(escpos)* parse ESC M (font select) and ESC p (open drawer) commands
+- *(ui)* Font B compact rendering at 75% scale with adjusted column widths (42/64 cols)
+- *(ui)* cash drawer open indicator (amber UI) on ESC p
+- *(ui)* respect line_spacing dots for wrapped text and newlines
+- *(ui)* align bit-image and QR code by PrinterState alignment (left/center/right)
+
 ## [1.6.0](https://github.com/moises717/escpos-viewer-pro/releases/tag/v1.6.0) - 2026-05-16
 
 ### Added
