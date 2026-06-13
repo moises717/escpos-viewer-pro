@@ -284,6 +284,32 @@ pub fn parse_escpos(data: &[u8], codepage: CodePage) -> Vec<ParsedCommand> {
                                 i += 2;
                             }
                         }
+                        0x4D => {
+                            // ESC M n (Select font: 0=Font A, 1=Font B)
+                            if i + 2 < data.len() {
+                                let n = data[i + 2];
+                                state.is_font_b = n == 1;
+                                commands.push((
+                                    state.clone(),
+                                    CommandType::Control(Control::FontSelect(state.is_font_b)),
+                                ));
+                                i += 3;
+                            } else {
+                                i += 2;
+                            }
+                        }
+                        0x70 => {
+                            // ESC p m t1 t2 (Generate pulse / Open drawer)
+                            if i + 4 < data.len() {
+                                commands.push((
+                                    state.clone(),
+                                    CommandType::Control(Control::OpenDrawer),
+                                ));
+                                i += 5;
+                            } else {
+                                i += 2;
+                            }
+                        }
                         _ => {
                             commands.push((
                                 state.clone(),
@@ -866,6 +892,36 @@ mod tests {
                 width: 2,
                 ..
             })
+        )));
+    }
+
+    #[test]
+    fn esc_m_selects_font_b() {
+        let data = [0x1B, 0x4D, 0x01, b'A', 0x1B, 0x4D, 0x00, b'B'];
+        let parsed = parse_escpos(&data, CodePage::Utf8Lossy);
+        
+        let a_state = parsed
+            .iter()
+            .find(|(_, c)| matches!(c, CommandType::Text(t) if t.contains('A')))
+            .map(|(s, _)| s)
+            .unwrap();
+        assert!(a_state.is_font_b);
+
+        let b_state = parsed
+            .iter()
+            .find(|(_, c)| matches!(c, CommandType::Text(t) if t.contains('B')))
+            .map(|(s, _)| s)
+            .unwrap();
+        assert!(!b_state.is_font_b);
+    }
+
+    #[test]
+    fn esc_p_opens_drawer() {
+        let data = [0x1B, 0x70, 0x00, 0x19, 0xFA];
+        let parsed = parse_escpos(&data, CodePage::Utf8Lossy);
+        assert!(parsed.iter().any(|(_, c)| matches!(
+            c,
+            CommandType::Control(Control::OpenDrawer)
         )));
     }
 }
