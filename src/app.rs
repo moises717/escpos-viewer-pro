@@ -925,20 +925,24 @@ impl EscPosViewer {
             Control::BitImage { mode, width, data } => {
                 format!("ESC * (BIT IMAGE mode={} w={} bytes={})", mode, width, data.len())
             }
+            Control::FontSelect(on) => format!("ESC M (FONT SELECT font_b={})", on),
+            Control::OpenDrawer => "ESC p (OPEN DRAWER)".to_string(),
             Control::EscUnknown(b) => format!("ESC {:02X} (?)", b),
             Control::GsUnknown(b) => format!("GS {:02X} (?)", b),
         }
     }
 
-    fn base_columns(paper_width: PaperWidth) -> usize {
-        match paper_width {
-            PaperWidth::W58mm => 32,
-            PaperWidth::W80mm => 48,
+    fn base_columns(paper_width: PaperWidth, is_font_b: bool) -> usize {
+        match (paper_width, is_font_b) {
+            (PaperWidth::W58mm, false) => 32,
+            (PaperWidth::W58mm, true) => 42,
+            (PaperWidth::W80mm, false) => 48,
+            (PaperWidth::W80mm, true) => 64,
         }
     }
 
     fn effective_columns(paper_width: PaperWidth, state: &PrinterState) -> usize {
-        let base = Self::base_columns(paper_width);
+        let base = Self::base_columns(paper_width, state.is_font_b);
         // Solo dividir por width_mul (ancho de caracteres)
         // El height_mul solo afecta la altura visual, no el ancho de columnas
         let div = state.char_width_mul.max(1) as usize;
@@ -952,6 +956,7 @@ impl EscPosViewer {
             && a.alignment == b.alignment
             && a.char_width_mul == b.char_width_mul
             && a.char_height_mul == b.char_height_mul
+            && a.is_font_b == b.is_font_b
     }
 
     fn nbsp_pad(count: usize) -> String {
@@ -1006,8 +1011,9 @@ impl EscPosViewer {
     ) {
         let cols = Self::effective_columns(paper_width, state);
         let lines = Self::split_and_wrap(text, cols);
+        let lines_len = lines.len();
 
-        for line in lines {
+        for (idx, line) in lines.into_iter().enumerate() {
             let len = line.chars().count();
             
             // Calculate padding based on alignment only
@@ -1036,7 +1042,10 @@ impl EscPosViewer {
             // Tamaño de fuente calculado para que el texto ocupe correctamente el ancho del papel
             // Para 58mm: 300px - 30px padding = 270px ÷ 32 cols ≈ 8.4px por carácter
             // La fuente monospace a 14px tiene aproximadamente 8.4px de ancho por carácter
-            let base_size = 14.0_f32;
+            let mut base_size = 14.0_f32;
+            if state.is_font_b {
+                base_size *= 0.75; // Simular Fuente B compacta (25% más pequeña)
+            }
             let height_mul = state.char_height_mul.max(1) as f32;
             let width_mul = state.char_width_mul.max(1) as f32;
             // Escalar por el multiplicador de altura para texto grande
@@ -1063,6 +1072,28 @@ impl EscPosViewer {
             }
 
             ui.add(egui::Label::new(rich_text));
+
+            // Añadir el interlineado configurado entre líneas envueltas de un mismo bloque de texto
+            if idx < lines_len - 1 {
+                let px_width = match paper_width {
+                    PaperWidth::W58mm => 240.0,
+                    PaperWidth::W80mm => 340.0,
+                };
+                let total_dots = match paper_width {
+                    PaperWidth::W58mm => 384.0,
+                    PaperWidth::W80mm => 576.0,
+                };
+                let dots_to_pixels = px_width / total_dots;
+                let n = state.line_spacing.unwrap_or(30) as f32;
+                let line_spacing_px = n * dots_to_pixels;
+                
+                let text_height_px = font_size * 1.15;
+                let item_spacing_y = ui.spacing().item_spacing.y;
+                let extra_space = (line_spacing_px - text_height_px - item_spacing_y).max(0.0);
+                if extra_space > 0.0 {
+                    ui.add_space(extra_space);
+                }
+            }
         }
     }
 
@@ -2171,7 +2202,27 @@ impl eframe::App for EscPosViewer {
                                             match control {
                                                 Control::Newline => {
                                                     flush_pending(ui, &mut pending);
-                                                    ui.add_space(5.0);
+                                                    
+                                                    let total_dots = match self.paper_width {
+                                                        PaperWidth::W58mm => 384.0,
+                                                        PaperWidth::W80mm => 576.0,
+                                                    };
+                                                    let dots_to_pixels = paper_width / total_dots;
+                                                    let n = state.line_spacing.unwrap_or(30) as f32;
+                                                    let line_spacing_px = n * dots_to_pixels;
+                                                    
+                                                    let mut base_size = 14.0_f32;
+                                                    if state.is_font_b {
+                                                        base_size *= 0.75;
+                                                    }
+                                                    let height_mul = state.char_height_mul.max(1) as f32;
+                                                    let font_size = base_size * height_mul;
+                                                    let text_height_px = font_size * 1.15;
+                                                    
+                                                    let item_spacing_y = ui.spacing().item_spacing.y;
+                                                    let extra_space = (line_spacing_px - text_height_px - item_spacing_y).max(0.0);
+                                                    
+                                                    ui.add_space(extra_space.max(1.0));
                                                 }
                                                 Control::Cut => {
                                                     flush_pending(ui, &mut pending);
@@ -2203,13 +2254,51 @@ impl eframe::App for EscPosViewer {
                                                             height,
                                                             data,
                                                         ));
-                                                        Self::show_image_scaled(
-                                                            ui,
-                                                            &mut texture_cache,
-                                                            key,
-                                                            img,
-                                                            paper_width,
-                                                        );
+                                                        
+                                                        // Calcular ancho visual proporcional real basado en dots
+                                                        let total_dots = match self.paper_width {
+                                                            PaperWidth::W58mm => 384.0,
+                                                            PaperWidth::W80mm => 576.0,
+                                                        };
+                                                        let dots_to_pixels = paper_width / total_dots;
+                                                        let img_display_width = ((*width_bytes as f32 * 8.0) * dots_to_pixels).min(paper_width);
+
+                                                        match state.alignment {
+                                                            Align::Center => {
+                                                                ui.vertical_centered(|ui| {
+                                                                    Self::show_image_scaled(
+                                                                        ui,
+                                                                        &mut texture_cache,
+                                                                        key,
+                                                                        img,
+                                                                        img_display_width,
+                                                                    );
+                                                                });
+                                                            }
+                                                            Align::Right => {
+                                                                ui.with_layout(
+                                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                                    |ui| {
+                                                                        Self::show_image_scaled(
+                                                                            ui,
+                                                                            &mut texture_cache,
+                                                                            key,
+                                                                            img,
+                                                                            img_display_width,
+                                                                        );
+                                                                    },
+                                                                );
+                                                            }
+                                                            Align::Left => {
+                                                                Self::show_image_scaled(
+                                                                    ui,
+                                                                    &mut texture_cache,
+                                                                    key,
+                                                                    img,
+                                                                    img_display_width,
+                                                                );
+                                                            }
+                                                        }
                                                         ui.add_space(8.0);
                                                     }
                                                 }
@@ -2233,15 +2322,43 @@ impl eframe::App for EscPosViewer {
                                                         ));
                                                         let target =
                                                             paper_width.min(260.0);
-                                                        ui.vertical_centered(|ui| {
-                                                            Self::show_image_scaled(
-                                                                ui,
-                                                                &mut texture_cache,
-                                                                key,
-                                                                img,
-                                                                target,
-                                                            );
-                                                        });
+
+                                                        match state.alignment {
+                                                            Align::Center => {
+                                                                ui.vertical_centered(|ui| {
+                                                                    Self::show_image_scaled(
+                                                                        ui,
+                                                                        &mut texture_cache,
+                                                                        key,
+                                                                        img,
+                                                                        target,
+                                                                    );
+                                                                });
+                                                            }
+                                                            Align::Right => {
+                                                                ui.with_layout(
+                                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                                    |ui| {
+                                                                        Self::show_image_scaled(
+                                                                            ui,
+                                                                            &mut texture_cache,
+                                                                            key,
+                                                                            img,
+                                                                            target,
+                                                                        );
+                                                                    },
+                                                                );
+                                                            }
+                                                            Align::Left => {
+                                                                Self::show_image_scaled(
+                                                                    ui,
+                                                                    &mut texture_cache,
+                                                                    key,
+                                                                    img,
+                                                                    target,
+                                                                );
+                                                            }
+                                                        }
                                                         ui.add_space(8.0);
                                                     } else {
                                                         ui.label(
@@ -2252,6 +2369,21 @@ impl eframe::App for EscPosViewer {
                                                             .monospace(),
                                                         );
                                                     }
+                                                }
+                                                Control::OpenDrawer => {
+                                                    flush_pending(ui, &mut pending);
+                                                    ui.add_space(8.0);
+                                                    ui.group(|ui| {
+                                                        ui.horizontal(|ui| {
+                                                            ui.label(
+                                                                egui::RichText::new("🔓 CAJÓN PORTAMONEDAS ABIERTO")
+                                                                    .size(11.0)
+                                                                    .color(egui::Color32::from_rgb(217, 119, 6)) // Amber-600
+                                                                    .strong(),
+                                                            );
+                                                        });
+                                                    });
+                                                    ui.add_space(8.0);
                                                 }
                                                 Control::Barcode { m, data } => {
                                                     flush_pending(ui, &mut pending);
